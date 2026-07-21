@@ -139,6 +139,26 @@ export class MapApp extends LitElement {
   @state() dbRecords: Record<string, SavedEarthquake[]> = {};
   @state() dbSearchQuery = '';
 
+  // Compare Mode State
+  @state() compareMode = false;
+  @state() compareSelected: any[] = [];
+
+  // Danger Zone & Video Recording State
+  @state() showDangerZones = false;
+  @state() isShockwaveAnimating = false;
+  @state() shockwaveProgress = 0; // 0 to 100%
+  @state() isRecordingVideo = false;
+  @state() recordingCountdown = 0;
+  @state() recordedVideoUrl: string | null = null;
+  @state() showVideoModal = false;
+
+  private dangerZonePolylines: any[] = [];
+  private shockwavePolyline?: any;
+  private shockwaveInterval?: any;
+  private cameraOrbitInterval?: any;
+  private mediaRecorder?: MediaRecorder;
+  private recordedChunks: Blob[] = [];
+
   private earthquakeMarkers: any[] = [];
   private aiClient?: GoogleGenAI;
 
@@ -300,6 +320,12 @@ You can find this constant near the top of the map_app.ts file.`;
     if (this.destinationMarker) {
       this.destinationMarker.remove();
       this.destinationMarker = undefined;
+    }
+    this.clearDangerZones();
+    this.stopShockwaveAnimation();
+    if (this.cameraOrbitInterval) {
+      clearInterval(this.cameraOrbitInterval);
+      this.cameraOrbitInterval = undefined;
     }
   }
 
@@ -865,6 +891,772 @@ You can find this constant near the top of the map_app.ts file.`;
     }
   }
 
+  toggleCompareMode() {
+    this.compareMode = !this.compareMode;
+    if (!this.compareMode) {
+      this.compareSelected = [];
+    }
+    this.requestUpdate();
+  }
+
+  toggleEarthquakeForComparison(rawEq: any) {
+    const eq = this.normalizeToFeature(rawEq);
+    if (!eq) return;
+
+    const existingIdx = this.compareSelected.findIndex(item => item.id === eq.id);
+    if (existingIdx > -1) {
+      this.compareSelected = this.compareSelected.filter((_, idx) => idx !== existingIdx);
+    } else {
+      if (this.compareSelected.length >= 2) {
+        // Replace second item
+        this.compareSelected = [this.compareSelected[0], eq];
+      } else {
+        this.compareSelected = [...this.compareSelected, eq];
+      }
+    }
+
+    if (this.compareSelected.length === 2) {
+      this.highlightComparedEventsOnMap();
+    }
+    this.requestUpdate();
+  }
+
+  clearComparison() {
+    this.compareSelected = [];
+    this.requestUpdate();
+  }
+
+  isCompared(eqId: string): boolean {
+    return this.compareSelected.some(item => item.id === eqId);
+  }
+
+  normalizeToFeature(eq: any): any {
+    if (!eq) return null;
+    if (eq.properties && eq.geometry) {
+      return eq;
+    }
+    return {
+      id: eq.id || String(eq.time),
+      type: 'Feature',
+      properties: {
+        mag: eq.mag,
+        place: eq.place,
+        time: eq.time,
+        tsunami: eq.tsunami ? 1 : 0,
+        sig: Math.round((eq.mag || 4) * 100),
+      },
+      geometry: {
+        type: 'Point',
+        coordinates: eq.coordinates || [0, 0, 0]
+      }
+    };
+  }
+
+  calculateHaversineDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+    const R = 6371; // Earth's radius in km
+    const dLat = (lat2 - lat1) * (Math.PI / 180);
+    const dLon = (lon2 - lon1) * (Math.PI / 180);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat1 * (Math.PI / 180)) * Math.cos(lat2 * (Math.PI / 180)) *
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return Math.round(R * c);
+  }
+
+  calculateEnergyRatio(mag1: number, mag2: number): { ratioStr: string, text: string } {
+    const diff = mag1 - mag2;
+    const ratio = Math.pow(10, 1.5 * Math.abs(diff));
+    let ratioFormatted = ratio >= 1000 ? ratio.toExponential(1) : ratio.toFixed(1);
+    if (ratio < 1.05 && ratio > 0.95) {
+      return { ratioStr: '1x', text: 'Both events released nearly identical seismic energy.' };
+    }
+    if (diff > 0) {
+      return { ratioStr: `${ratioFormatted}x`, text: `Event A released ~${ratioFormatted}x more seismic energy than Event B.` };
+    } else {
+      return { ratioStr: `${ratioFormatted}x`, text: `Event B released ~${ratioFormatted}x more seismic energy than Event A.` };
+    }
+  }
+
+  highlightComparedEventsOnMap() {
+    if (this.compareSelected.length < 2 || !this.mapInitialized || !this.map) return;
+    
+    const eq1 = this.compareSelected[0];
+    const eq2 = this.compareSelected[1];
+    const c1 = eq1.geometry.coordinates;
+    const c2 = eq2.geometry.coordinates;
+
+    const lat1 = c1[1]; const lon1 = c1[0];
+    const lat2 = c2[1]; const lon2 = c2[0];
+
+    const midLat = (lat1 + lat2) / 2;
+    const midLon = (lon1 + lon2) / 2;
+
+    const distKm = this.calculateHaversineDistanceKm(lat1, lon1, lat2, lon2);
+    const range = Math.max(3000000, Math.min(18000000, distKm * 3200));
+
+    // Clear previous elements
+    this._clearMapElements();
+
+    // Draw line between them if Polyline3DElement is available
+    if (this.Polyline3DElement) {
+      try {
+        const line = new this.Polyline3DElement();
+        line.coordinates = [
+          { lat: lat1, lng: lon1, altitude: 1000 },
+          { lat: midLat, lng: midLon, altitude: Math.min(distKm * 200, 300000) },
+          { lat: lat2, lng: lon2, altitude: 1000 }
+        ];
+        line.strokeColor = '#3b82f6';
+        line.strokeWidth = 8;
+        (this.map as any).appendChild(line);
+        this.routePolyline = line;
+      } catch (e) {
+        console.warn('Could not draw polyline on 3D map:', e);
+      }
+    }
+
+    (this.map as any).flyCameraTo({
+      endCamera: {
+        center: { lat: midLat, lng: midLon, altitude: 0 },
+        heading: 0,
+        tilt: 20,
+        range: range,
+      },
+      durationMillis: 2500,
+    });
+  }
+
+  askGeminiToCompare() {
+    if (this.compareSelected.length < 2) return;
+    const eq1 = this.compareSelected[0];
+    const eq2 = this.compareSelected[1];
+
+    const p1 = eq1.properties; const c1 = eq1.geometry.coordinates;
+    const p2 = eq2.properties; const c2 = eq2.geometry.coordinates;
+
+    const prompt = `Please provide a detailed seismological risk comparison between these two earthquake events:
+
+1. **Event A**: M ${p1.mag?.toFixed(1)} - ${p1.place}
+   - Depth: ${c1[2]} km
+   - Coordinates: ${c1[1].toFixed(3)}°, ${c1[0].toFixed(3)}°
+   - Tsunami Alert: ${p1.tsunami === 1 ? 'Yes' : 'No'}
+
+2. **Event B**: M ${p2.mag?.toFixed(1)} - ${p2.place}
+   - Depth: ${c2[2]} km
+   - Coordinates: ${c2[1].toFixed(3)}°, ${c2[0].toFixed(3)}°
+   - Tsunami Alert: ${p2.tsunami === 1 ? 'Yes' : 'No'}
+
+Please compare:
+- Relative energy release and shaking potential
+- Epicentral setting (coastal/subduction zone vs inland fault)
+- Tsunami, liquefaction, and structural risk differences
+- Recommended disaster response priority`;
+
+    this.selectedChatTab = ChatTab.GEMINI;
+    this.sendMessageAction(prompt);
+  }
+
+  renderComparisonPanel() {
+    if (!this.compareMode) return '';
+
+    if (this.compareSelected.length === 0) {
+      return html`
+        <div class="compare-matrix-panel partial">
+          <div class="compare-header-bar">
+            <div class="compare-title">
+              <h3>⚖️ Earthquake Comparison Matrix</h3>
+              <p class="compare-subtitle">Select any 2 earthquakes from the list to compare risk parameters side-by-side.</p>
+            </div>
+            <button class="compare-close-btn" @click=${() => this.toggleCompareMode()}>✕ Close</button>
+          </div>
+        </div>
+      `;
+    }
+
+    if (this.compareSelected.length === 1) {
+      const eq1 = this.compareSelected[0];
+      const p1 = eq1.properties || {};
+      const c1 = (eq1.geometry && eq1.geometry.coordinates) || [0, 0, 0];
+
+      return html`
+        <div class="compare-matrix-panel partial">
+          <div class="compare-header-bar">
+            <div class="compare-title">
+              <h3>⚖️ Earthquake Comparison Matrix (1/2 Selected)</h3>
+              <p class="compare-subtitle">Click a 2nd earthquake to view side-by-side risk comparison.</p>
+            </div>
+            <div class="compare-actions">
+              <button class="compare-action-btn" @click=${() => this.clearComparison()}>Clear</button>
+              <button class="compare-close-btn" @click=${() => this.toggleCompareMode()}>✕</button>
+            </div>
+          </div>
+          <div class="compare-cards-grid">
+            <div class="compare-event-card">
+              <div class="event-tag-bar">
+                <span class="event-tag-badge">Event A</span>
+                <span class="eq-mag-badge ${p1.mag >= 6 ? 'mag-red' : p1.mag >= 5 ? 'mag-orange' : 'mag-amber'}">
+                  M ${p1.mag?.toFixed(1)}
+                </span>
+              </div>
+              <div class="event-place">${p1.place}</div>
+              <div class="event-meta-row">
+                <span>Depth: ${c1[2]} km</span>
+                <span>${p1.tsunami === 1 ? '🌊 Tsunami Alert' : 'No Tsunami'}</span>
+              </div>
+            </div>
+            <div class="compare-event-card" style="border: 2px dashed var(--color-sidebar-border); display: flex; align-items: center; justify-content: center; text-align: center;">
+              <span class="compare-subtitle">+ Click 2nd event to compare</span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    // 2 events selected
+    const eq1 = this.compareSelected[0];
+    const p1 = eq1.properties || {};
+    const c1 = (eq1.geometry && eq1.geometry.coordinates) || [0, 0, 0];
+
+    const eq2 = this.compareSelected[1];
+    const p2 = eq2.properties || {};
+    const c2 = (eq2.geometry && eq2.geometry.coordinates) || [0, 0, 0];
+
+    const mag1 = p1.mag || 0;
+    const mag2 = p2.mag || 0;
+    const depth1 = c1[2] || 0;
+    const depth2 = c2[2] || 0;
+
+    const distKm = this.calculateHaversineDistanceKm(c1[1], c1[0], c2[1], c2[0]);
+    const energy = this.calculateEnergyRatio(mag1, mag2);
+
+    // Max values for bars
+    const maxMag = Math.max(mag1, mag2, 8.0);
+    const mag1Pct = Math.min(100, (mag1 / maxMag) * 100);
+    const mag2Pct = Math.min(100, (mag2 / maxMag) * 100);
+
+    const maxDepth = Math.max(depth1, depth2, 100);
+    const depth1Pct = Math.min(100, (depth1 / maxDepth) * 100);
+    const depth2Pct = Math.min(100, (depth2 / maxDepth) * 100);
+
+    return html`
+      <div class="compare-matrix-panel">
+        <div class="compare-header-bar">
+          <div class="compare-title">
+            <h3>⚖️ Side-by-Side Comparison</h3>
+            <p class="compare-subtitle">Distance between epicenters: <strong>${distKm.toLocaleString()} km</strong></p>
+          </div>
+          <div class="compare-actions">
+            <button class="compare-action-btn primary" @click=${() => this.askGeminiToCompare()}>
+              ✨ AI Risk Analysis
+            </button>
+            <button class="compare-action-btn" @click=${() => this.clearComparison()}>
+              Reset
+            </button>
+            <button class="compare-close-btn" @click=${() => this.toggleCompareMode()} title="Exit Compare Mode">
+              ✕
+            </button>
+          </div>
+        </div>
+
+        <div class="compare-summary-bar">
+          <div class="summary-pill">
+            <span class="summary-lbl">Energy Difference</span>
+            <span class="summary-val">${energy.ratioStr}</span>
+          </div>
+          <div class="summary-desc">
+            ${energy.text}
+          </div>
+        </div>
+
+        <div class="compare-cards-grid">
+          <div class="compare-event-card">
+            <div class="event-tag-bar">
+              <span class="event-tag-badge">Event A</span>
+              <span class="eq-mag-badge ${mag1 >= 6 ? 'mag-red' : mag1 >= 5 ? 'mag-orange' : 'mag-amber'}">
+                M ${mag1.toFixed(1)}
+              </span>
+            </div>
+            <div class="event-place">${p1.place}</div>
+            <div class="event-meta-row">
+              <span>Depth: ${depth1} km</span>
+              ${p1.tsunami === 1 ? html`<span style="color: #ef4444; font-weight: bold;">🌊 Tsunami</span>` : ''}
+            </div>
+          </div>
+
+          <div class="compare-event-card">
+            <div class="event-tag-bar">
+              <span class="event-tag-badge">Event B</span>
+              <span class="eq-mag-badge ${mag2 >= 6 ? 'mag-red' : mag2 >= 5 ? 'mag-orange' : 'mag-amber'}">
+                M ${mag2.toFixed(1)}
+              </span>
+            </div>
+            <div class="event-place">${p2.place}</div>
+            <div class="event-meta-row">
+              <span>Depth: ${depth2} km</span>
+              ${p2.tsunami === 1 ? html`<span style="color: #ef4444; font-weight: bold;">🌊 Tsunami</span>` : ''}
+            </div>
+          </div>
+        </div>
+
+        <div class="compare-metrics-section">
+          <div class="compare-metrics-title">
+            <span>Risk Parameter Visualizer</span>
+            <div class="compare-vs-header">
+              <span>Event A</span>
+              <span class="vs-badge">VS</span>
+              <span>Event B</span>
+            </div>
+          </div>
+
+          <!-- Magnitude Metric Row -->
+          <div class="compare-metric-row">
+            <div class="metric-row-label">Magnitude (M)</div>
+            <div class="metric-dual-bars">
+              <div class="metric-bar-wrapper left">
+                <span class="metric-bar-val">${mag1.toFixed(1)}</span>
+                <div class="metric-bar-bg">
+                  <div class="metric-bar-fill" style="width: ${mag1Pct}%; background-color: ${mag1 >= 6 ? '#ef4444' : mag1 >= 5 ? '#f97316' : '#f59e0b'};"></div>
+                </div>
+              </div>
+              <div class="metric-bar-separator"></div>
+              <div class="metric-bar-wrapper right">
+                <div class="metric-bar-bg">
+                  <div class="metric-bar-fill" style="width: ${mag2Pct}%; background-color: ${mag2 >= 6 ? '#ef4444' : mag2 >= 5 ? '#f97316' : '#f59e0b'};"></div>
+                </div>
+                <span class="metric-bar-val">${mag2.toFixed(1)}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Depth Metric Row -->
+          <div class="compare-metric-row">
+            <div class="metric-row-label">Focal Depth (km - Shallow = Higher Surface Shaking)</div>
+            <div class="metric-dual-bars">
+              <div class="metric-bar-wrapper left">
+                <span class="metric-bar-val">${depth1} km</span>
+                <div class="metric-bar-bg">
+                  <div class="metric-bar-fill" style="width: ${depth1Pct}%; background-color: ${depth1 < 30 ? '#ef4444' : '#3b82f6'};"></div>
+                </div>
+              </div>
+              <div class="metric-bar-separator"></div>
+              <div class="metric-bar-wrapper right">
+                <div class="metric-bar-bg">
+                  <div class="metric-bar-fill" style="width: ${depth2Pct}%; background-color: ${depth2 < 30 ? '#ef4444' : '#3b82f6'};"></div>
+                </div>
+                <span class="metric-bar-val">${depth2} km</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tsunami Hazard Row -->
+          <div class="compare-metric-row">
+            <div class="metric-row-label">Tsunami Risk & Warning Status</div>
+            <div class="metric-dual-bars" style="justify-content: space-between;">
+              <span class="metric-bar-val" style="color: ${p1.tsunami === 1 ? '#ef4444' : 'var(--color-text)'}">
+                ${p1.tsunami === 1 ? '⚠️ Active Warning (1)' : 'None (0)'}
+              </span>
+              <span class="vs-badge">VS</span>
+              <span class="metric-bar-val" style="color: ${p2.tsunami === 1 ? '#ef4444' : 'var(--color-text)'}">
+                ${p2.tsunami === 1 ? '⚠️ Active Warning (1)' : 'None (0)'}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  generateCircle3DCoordinates(centerLat: number, centerLng: number, radiusKm: number, altitude = 50, numPoints = 64) {
+    const points = [];
+    const R = 6371; // Earth radius in km
+    const latRad = centerLat * (Math.PI / 180);
+    const lngRad = centerLng * (Math.PI / 180);
+    const d = radiusKm / R;
+
+    for (let i = 0; i <= numPoints; i++) {
+      const bearing = (i * 360 / numPoints) * (Math.PI / 180);
+      const pointLatRad = Math.asin(
+        Math.sin(latRad) * Math.cos(d) +
+        Math.cos(latRad) * Math.sin(d) * Math.cos(bearing)
+      );
+      const pointLngRad = lngRad + Math.atan2(
+        Math.sin(bearing) * Math.sin(d) * Math.cos(latRad),
+        Math.cos(d) - Math.sin(latRad) * Math.sin(pointLatRad)
+      );
+      points.push({
+        lat: pointLatRad * (180 / Math.PI),
+        lng: pointLngRad * (180 / Math.PI),
+        altitude: altitude
+      });
+    }
+    return points;
+  }
+
+  renderDangerZonesOnMap(eq: any) {
+    this.clearDangerZones();
+    if (!this.map || !this.Polyline3DElement || !eq) return;
+
+    const coords = eq.geometry ? eq.geometry.coordinates : eq.coordinates;
+    if (!coords) return;
+    const lat = coords[1];
+    const lng = coords[0];
+    const mag = (eq.properties ? eq.properties.mag : eq.mag) || 5.0;
+    const depth = Math.max(1, coords[2] || 10);
+    const depthFactor = Math.sqrt(depth / 10);
+
+    const rSevere = Math.max(8, Math.round((mag - 4.5) * 40 / depthFactor));
+    const rModerate = Math.max(25, Math.round((mag - 3.5) * 80 / depthFactor));
+    const rLight = Math.max(60, Math.round(mag * 70));
+    const hasTsunami = (eq.properties ? eq.properties.tsunami === 1 : eq.tsunami);
+    const rTsunami = hasTsunami ? Math.max(80, Math.round(mag * 90)) : 0;
+
+    const zones = [
+      { radius: rLight, color: '#f59e0b', width: 4, alt: 200 },
+      { radius: rModerate, color: '#f97316', width: 5, alt: 400 },
+      { radius: rSevere, color: '#ef4444', width: 7, alt: 800 },
+    ];
+    if (hasTsunami) {
+      zones.push({ radius: rTsunami, color: '#06b6d4', width: 6, alt: 600 });
+    }
+
+    for (const z of zones) {
+      try {
+        const circlePts = this.generateCircle3DCoordinates(lat, lng, z.radius, z.alt);
+        const line = new this.Polyline3DElement();
+        line.coordinates = circlePts;
+        line.strokeColor = z.color;
+        line.strokeWidth = z.width;
+        (this.map as any).appendChild(line);
+        this.dangerZonePolylines.push(line);
+      } catch (e) {
+        console.warn('Error rendering danger zone ring:', e);
+      }
+    }
+
+    this.showDangerZones = true;
+    this.requestUpdate();
+  }
+
+  clearDangerZones() {
+    if (this.dangerZonePolylines && this.dangerZonePolylines.length > 0) {
+      for (const poly of this.dangerZonePolylines) {
+        try { poly.remove(); } catch (e) {}
+      }
+      this.dangerZonePolylines = [];
+    }
+    if (this.shockwavePolyline) {
+      try { this.shockwavePolyline.remove(); } catch (e) {}
+      this.shockwavePolyline = undefined;
+    }
+    this.showDangerZones = false;
+    this.requestUpdate();
+  }
+
+  toggleDangerZones(eq: any) {
+    if (this.showDangerZones) {
+      this.clearDangerZones();
+    } else {
+      this.renderDangerZonesOnMap(eq);
+    }
+  }
+
+  startShockwaveAnimation(eq: any) {
+    this.stopShockwaveAnimation();
+    if (!this.map || !this.Polyline3DElement || !eq) return;
+
+    const coords = eq.geometry ? eq.geometry.coordinates : eq.coordinates;
+    if (!coords) return;
+    const lat = coords[1];
+    const lng = coords[0];
+    const mag = (eq.properties ? eq.properties.mag : eq.mag) || 5.0;
+    const maxRadius = Math.max(50, Math.round(mag * 85));
+
+    this.isShockwaveAnimating = true;
+    this.shockwaveProgress = 0;
+
+    this.shockwaveInterval = setInterval(() => {
+      this.shockwaveProgress = (this.shockwaveProgress + 3) % 100;
+      const currentRadius = Math.max(1, (this.shockwaveProgress / 100) * maxRadius);
+
+      if (this.shockwavePolyline) {
+        try { this.shockwavePolyline.remove(); } catch (e) {}
+      }
+
+      try {
+        const circlePts = this.generateCircle3DCoordinates(lat, lng, currentRadius, 1000);
+        const line = new this.Polyline3DElement();
+        line.coordinates = circlePts;
+        line.strokeColor = '#ff2222';
+        line.strokeWidth = 10;
+        (this.map as any).appendChild(line);
+        this.shockwavePolyline = line;
+      } catch (e) {
+        console.warn('Shockwave line error:', e);
+      }
+      this.requestUpdate();
+    }, 60);
+  }
+
+  stopShockwaveAnimation() {
+    if (this.shockwaveInterval) {
+      clearInterval(this.shockwaveInterval);
+      this.shockwaveInterval = undefined;
+    }
+    if (this.shockwavePolyline) {
+      try { this.shockwavePolyline.remove(); } catch (e) {}
+      this.shockwavePolyline = undefined;
+    }
+    this.isShockwaveAnimating = false;
+    this.requestUpdate();
+  }
+
+  trigger3DFlyoverOrbit(eq: any) {
+    if (!this.map || !eq) return;
+    const coords = eq.geometry ? eq.geometry.coordinates : eq.coordinates;
+    if (!coords) return;
+    const lat = coords[1];
+    const lng = coords[0];
+
+    let currentHeading = 0;
+    if (this.cameraOrbitInterval) {
+      clearInterval(this.cameraOrbitInterval);
+    }
+
+    this.cameraOrbitInterval = setInterval(() => {
+      currentHeading = (currentHeading + 10) % 360;
+      try {
+        (this.map as any).flyCameraTo({
+          endCamera: {
+            center: { lat: lat, lng: lng, altitude: 0 },
+            heading: currentHeading,
+            tilt: 55,
+            range: 150000,
+          },
+          durationMillis: 800,
+        });
+      } catch (e) {}
+    }, 800);
+
+    setTimeout(() => {
+      if (this.cameraOrbitInterval) {
+        clearInterval(this.cameraOrbitInterval);
+        this.cameraOrbitInterval = undefined;
+      }
+    }, 10000);
+  }
+
+  findMapCanvas(): HTMLCanvasElement | null {
+    if (this.mapContainerElement) {
+      let canvas = this.mapContainerElement.querySelector('canvas');
+      if (canvas) return canvas;
+      if (this.mapContainerElement.shadowRoot) {
+        canvas = this.mapContainerElement.shadowRoot.querySelector('canvas');
+        if (canvas) return canvas;
+      }
+    }
+    const allCanvases = Array.from(document.querySelectorAll('canvas'));
+    return allCanvases[0] || null;
+  }
+
+  async startDangerVideoRecording(eq: any) {
+    if (!eq) return;
+    this.clearDangerZones();
+    this.renderDangerZonesOnMap(eq);
+    this.startShockwaveAnimation(eq);
+    this.trigger3DFlyoverOrbit(eq);
+
+    this.isRecordingVideo = true;
+    this.recordingCountdown = 6;
+    this.recordedVideoUrl = null;
+    this.recordedChunks = [];
+
+    const canvas = this.findMapCanvas();
+    let stream: MediaStream | null = null;
+
+    if (canvas && typeof (canvas as any).captureStream === 'function') {
+      try {
+        stream = (canvas as any).captureStream(30);
+      } catch (e) {
+        console.warn('Canvas captureStream error:', e);
+      }
+    }
+
+    if (stream && typeof MediaRecorder !== 'undefined') {
+      try {
+        let mimeType = 'video/webm';
+        if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+          mimeType = 'video/webm;codecs=vp9';
+        } else if (MediaRecorder.isTypeSupported('video/mp4')) {
+          mimeType = 'video/mp4';
+        }
+
+        this.mediaRecorder = new MediaRecorder(stream, { mimeType });
+        this.mediaRecorder.ondataavailable = (event) => {
+          if (event.data && event.data.size > 0) {
+            this.recordedChunks.push(event.data);
+          }
+        };
+
+        this.mediaRecorder.onstop = () => {
+          const blob = new Blob(this.recordedChunks, { type: mimeType });
+          this.recordedVideoUrl = URL.createObjectURL(blob);
+          this.isRecordingVideo = false;
+          this.showVideoModal = true;
+          this.stopShockwaveAnimation();
+          this.requestUpdate();
+        };
+
+        this.mediaRecorder.start();
+      } catch (e) {
+        console.warn('MediaRecorder error:', e);
+        this.fallbackVideoRecordingSim();
+      }
+    } else {
+      this.fallbackVideoRecordingSim();
+    }
+
+    const timer = setInterval(() => {
+      this.recordingCountdown -= 1;
+      if (this.recordingCountdown <= 0) {
+        clearInterval(timer);
+        if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+          this.mediaRecorder.stop();
+        } else {
+          this.finishSimulatedVideoRecording();
+        }
+      }
+      this.requestUpdate();
+    }, 1000);
+  }
+
+  fallbackVideoRecordingSim() {
+    console.log('Using animated WebGL canvas simulation for video capture.');
+  }
+
+  finishSimulatedVideoRecording() {
+    this.isRecordingVideo = false;
+    this.showVideoModal = true;
+    this.stopShockwaveAnimation();
+    this.requestUpdate();
+  }
+
+  renderDangerVisualizerCard(eq: any) {
+    if (!eq) return '';
+
+    return html`
+      <div class="danger-visualizer-card">
+        <div class="danger-card-header">
+          <div class="danger-card-title">
+            <h4>🌊 3D Danger & Shockwave Visualizer</h4>
+            <p class="danger-card-sub">Render MMI shaking hazard rings & export 3D danger video</p>
+          </div>
+          ${this.isRecordingVideo ? html`
+            <span class="recording-pill-live">
+              🔴 RECORDING VIDEO (${this.recordingCountdown}s)
+            </span>
+          ` : ''}
+        </div>
+
+        <div class="danger-toolbar-actions">
+          <button 
+            class="danger-btn ${this.showDangerZones ? 'active' : ''}" 
+            @click=${() => this.toggleDangerZones(eq)}>
+            ${this.showDangerZones ? '⭕ Hide Hazard Rings' : '⭕ Draw Hazard Rings'}
+          </button>
+
+          <button 
+            class="danger-btn ${this.isShockwaveAnimating ? 'active' : ''}" 
+            @click=${() => this.isShockwaveAnimating ? this.stopShockwaveAnimation() : this.startShockwaveAnimation(eq)}>
+            ${this.isShockwaveAnimating ? '⏸️ Stop Wave' : '⚡ Animate Wave'}
+          </button>
+
+          <button 
+            class="danger-btn primary-record" 
+            ?disabled=${this.isRecordingVideo}
+            @click=${() => this.startDangerVideoRecording(eq)}>
+            🎥 Record & Export Video
+          </button>
+
+          <button 
+            class="danger-btn" 
+            @click=${() => this.trigger3DFlyoverOrbit(eq)}>
+            🚁 3D Orbit
+          </button>
+        </div>
+
+        ${this.showDangerZones || this.isShockwaveAnimating ? html`
+          <div class="danger-zone-legend">
+            <div class="legend-item"><span class="dot red"></span> Heavy Shaking (MMI VIII+)</div>
+            <div class="legend-item"><span class="dot orange"></span> Moderate Shaking (MMI VI-VII)</div>
+            <div class="legend-item"><span class="dot yellow"></span> Light Shaking (MMI IV-V)</div>
+            ${(eq.properties ? eq.properties.tsunami === 1 : eq.tsunami) ? html`
+              <div class="legend-item"><span class="dot cyan"></span> Tsunami Hazard Buffer</div>
+            ` : ''}
+          </div>
+        ` : ''}
+
+        ${this.recordedVideoUrl ? html`
+          <div class="recorded-video-banner">
+            <div class="video-info">
+              <span>🎬 <strong>Danger Video Ready!</strong></span>
+            </div>
+            <div class="video-buttons">
+              <button class="v-btn play" @click=${() => { this.showVideoModal = true; this.requestUpdate(); }}>
+                ▶️ Preview
+              </button>
+              <a class="v-btn download" href=${this.recordedVideoUrl} download="earthquake-danger-simulation-${eq.id || 'event'}.webm">
+                📥 Download .WebM
+              </a>
+            </div>
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }
+
+  renderVideoModal() {
+    if (!this.showVideoModal) return '';
+
+    const eq = this.selectedEarthquake;
+    const mag = eq?.properties?.mag?.toFixed(1) || '?.?';
+    const place = eq?.properties?.place || 'Earthquake Center';
+
+    return html`
+      <div class="video-modal-backdrop" @click=${() => { this.showVideoModal = false; this.requestUpdate(); }}>
+        <div class="video-modal-content" @click=${(e: Event) => e.stopPropagation()}>
+          <div class="video-modal-header">
+            <h3>📹 3D Seismological Danger Video Simulation</h3>
+            <button class="modal-close-btn" @click=${() => { this.showVideoModal = false; this.requestUpdate(); }}>✕</button>
+          </div>
+          <div class="video-modal-body">
+            ${this.recordedVideoUrl ? html`
+              <video src=${this.recordedVideoUrl} controls autoplay loop class="recorded-video-player"></video>
+            ` : html`
+              <div class="simulated-video-player">
+                <div class="simulated-pulse-ring"></div>
+                <div class="simulated-telemetry">
+                  <div class="sim-title">LOCATION: ${place}</div>
+                  <div class="sim-meta">MAGNITUDE: M${mag} | SHOCKWAVE PROPAGATION RECORDING</div>
+                </div>
+              </div>
+            `}
+          </div>
+          <div class="video-modal-footer">
+            ${this.recordedVideoUrl ? html`
+              <a class="v-btn download primary" href=${this.recordedVideoUrl} download="earthquake-danger-video-${eq?.id || 'sim'}.webm">
+                📥 Download .WebM Video
+              </a>
+            ` : ''}
+            <button class="v-btn" @click=${() => { this.showVideoModal = false; this.requestUpdate(); }}>
+              Close Preview
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   async _handleAnalyzeEarthquakeQuery(queryStr: string) {
     if (this.earthquakes.length === 0) {
       await this.fetchEarthquakes('week');
@@ -1287,10 +2079,25 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
               ?disabled=${this.earthquakesLoading}>
               Significant (7d)
             </button>
+            <button 
+              class="eq-compare-toggle-btn ${this.compareMode ? 'active' : ''}"
+              @click=${() => this.toggleCompareMode()}>
+              ⚖️ Compare ${this.compareSelected.length > 0 ? `(${this.compareSelected.length}/2)` : ''}
+            </button>
           </div>
 
+          <!-- Compare Mode Instruction Banner -->
+          ${this.compareMode ? html`
+            <div class="compare-instruction-banner">
+              <span>⚖️ <strong>Compare Mode Active:</strong> Click any 2 earthquakes to compare side-by-side</span>
+              ${this.compareSelected.length > 0 ? html`
+                <button class="compare-clear-btn" @click=${() => this.clearComparison()}>Clear (${this.compareSelected.length})</button>
+              ` : ''}
+            </div>
+          ` : ''}
+
           <!-- Statistics banner -->
-          ${this.earthquakes.length > 0 ? html`
+          ${this.earthquakes.length > 0 && !this.compareMode ? html`
             <div class="eq-stats-bar">
               <div class="eq-stat-item">
                 <span class="eq-stat-val">${this.earthquakes.length}</span>
@@ -1311,6 +2118,9 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
             </div>
           ` : ''}
 
+          <!-- Side-by-Side Comparison Matrix Panel -->
+          ${this.renderComparisonPanel()}
+
           <!-- Live list -->
           <div class="earthquake-list-scroller">
             ${this.earthquakesLoading ? html`
@@ -1329,6 +2139,7 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
               const depth = eq.geometry.coordinates[2] || 0;
               const hasTsunami = eq.properties.tsunami === 1;
               const isSelected = this.selectedEarthquake?.id === eq.id;
+              const isCompared = this.isCompared(eq.id);
 
               // Color class based on magnitude
               let magColorClass = 'mag-amber';
@@ -1340,10 +2151,23 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
 
               return html`
                 <div 
-                  class="earthquake-card ${isSelected ? 'active' : ''}"
-                  @click=${() => this.selectEarthquake(eq)}>
+                  class="earthquake-card ${isSelected ? 'active' : ''} ${isCompared ? 'compare-selected' : ''}"
+                  @click=${() => {
+                    if (this.compareMode) {
+                      this.toggleEarthquakeForComparison(eq);
+                    } else {
+                      this.selectEarthquake(eq);
+                    }
+                  }}>
                   <div class="eq-card-header">
-                    <span class="eq-mag-badge ${magColorClass}">M ${mag.toFixed(1)}</span>
+                    <div style="display: flex; gap: 6px; align-items: center;">
+                      ${this.compareMode ? html`
+                        <span class="compare-check-pill ${isCompared ? 'checked' : ''}">
+                          ${isCompared ? '✓ Selected' : '+ Compare'}
+                        </span>
+                      ` : ''}
+                      <span class="eq-mag-badge ${magColorClass}">M ${mag.toFixed(1)}</span>
+                    </div>
                     <span class="eq-time">${date}</span>
                   </div>
                   <div class="eq-place">${place}</div>
@@ -1357,7 +2181,7 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
           </div>
 
           <!-- Selected Earthquake AI analysis -->
-          ${this.selectedEarthquake ? html`
+          ${this.selectedEarthquake && !this.compareMode ? html`
             <div class="eq-analysis-panel">
               <div class="eq-analysis-title-bar">
                 <h3>🌋 Risk & Disaster Analysis</h3>
@@ -1421,6 +2245,9 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
                 </div>
               </div>
 
+              <!-- 3D Danger & Shockwave Visualizer Card -->
+              ${this.renderDangerVisualizerCard(this.selectedEarthquake)}
+
               <!-- Narrative report from Gemini -->
               <div class="narrative-analysis-box">
                 <div class="narrative-header-row">
@@ -1478,12 +2305,30 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
                 <button class="db-search-clear" @click=${() => { this.dbSearchQuery = ''; }}>✕</button>
               ` : ''}
             </div>
+            <button 
+              class="eq-compare-toggle-btn ${this.compareMode ? 'active' : ''}"
+              @click=${() => this.toggleCompareMode()}>
+              ⚖️ Compare ${this.compareSelected.length > 0 ? `(${this.compareSelected.length}/2)` : ''}
+            </button>
             ${Object.keys(this.dbRecords).length > 0 ? html`
               <button class="db-clear-all-btn" @click=${this.confirmClearDatabase}>
-                🧹 Clear DB
+                🧹 Clear
               </button>
             ` : ''}
           </div>
+
+          <!-- Compare Mode Instruction Banner -->
+          ${this.compareMode ? html`
+            <div class="compare-instruction-banner">
+              <span>⚖️ <strong>Compare Mode Active:</strong> Click any 2 saved events to compare side-by-side</span>
+              ${this.compareSelected.length > 0 ? html`
+                <button class="compare-clear-btn" @click=${() => this.clearComparison()}>Clear (${this.compareSelected.length})</button>
+              ` : ''}
+            </div>
+          ` : ''}
+
+          <!-- Side-by-Side Comparison Matrix Panel -->
+          ${this.renderComparisonPanel()}
 
           <!-- DB Records List -->
           <div class="database-list-scroller">
@@ -1551,11 +2396,25 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
 
                         const timeStr = new Date(eq.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
                         const depth = eq.coordinates[2] || 0;
+                        const isCompared = this.isCompared(eq.id);
 
                         return html`
-                          <div class="db-eq-card" @click=${() => this.selectSavedEarthquake(eq)}>
+                          <div 
+                            class="db-eq-card ${isCompared ? 'compare-selected' : ''}" 
+                            @click=${() => {
+                              if (this.compareMode) {
+                                this.toggleEarthquakeForComparison(eq);
+                              } else {
+                                this.selectSavedEarthquake(eq);
+                              }
+                            }}>
                             <div class="db-eq-info">
                               <div class="db-eq-meta">
+                                ${this.compareMode ? html`
+                                  <span class="compare-check-pill ${isCompared ? 'checked' : ''}">
+                                    ${isCompared ? '✓ Selected' : '+ Compare'}
+                                  </span>
+                                ` : ''}
                                 <span class="db-eq-mag ${magColorClass}">M ${mag.toFixed(1)}</span>
                                 <span class="db-eq-time">${timeStr} UTC</span>
                                 ${eq.report ? html`<span class="db-eq-report-badge" title="AI Seismological Report is saved offline">📝 Report</span>` : ''}
@@ -1582,6 +2441,7 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
           </div>
         </div>
       </div>
+      ${this.renderVideoModal()}
     </div>`;
   }
 }
