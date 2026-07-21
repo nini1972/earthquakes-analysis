@@ -215,11 +215,15 @@ textarea {
   color: var(--color-accent-disabled);
 }
 
-#chat { /* Container for messages and input area within sidebar */
+#chat, #chat-panel.showtab { /* Container for messages and input area within sidebar */
   flex: 1;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+#chat-panel:not(.showtab) {
+  display: none !important;
 }
 
 .footer { /* Groups chat status and input area */
@@ -694,15 +698,8 @@ canvas {
     border-top: 1px solid var(--color-sidebar-border, #ddd); /* Border between map and chat */
   }
 
-  .selector {
-    display: none;
-  }
-
   #editor {
     display: none!important;
-  }
-  #chat {
-    display: flex!important;
   }
 
   .toolbar {
@@ -854,7 +851,6 @@ code.hljs {
 
 /* --- Live Earthquakes Tab Panel Styles --- */
 .earthquakes-container {
-  display: flex;
   flex-direction: column;
   height: 100%;
   overflow: hidden;
