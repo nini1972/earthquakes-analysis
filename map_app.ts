@@ -30,6 +30,7 @@ import {unsafeHTML} from 'lit/directives/unsafe-html.js';
 import {GoogleGenAI} from '@google/genai';
 
 import {MapParams} from './mcp_maps_server';
+import {EarthquakeDB, SavedEarthquake} from './earthquake_db';
 
 /** Markdown formatting function with syntax hilighting */
 export const marked = new Marked(
@@ -71,6 +72,7 @@ export enum ChatState {
 export enum ChatTab {
   GEMINI,
   EARTHQUAKES,
+  DATABASE,
 }
 
 /**
@@ -133,6 +135,10 @@ export class MapApp extends LitElement {
   @state() analysisReport = '';
   @state() analysisLoading = false;
 
+  // Local Database State
+  @state() dbRecords: Record<string, SavedEarthquake[]> = {};
+  @state() dbSearchQuery = '';
+
   private earthquakeMarkers: any[] = [];
   private aiClient?: GoogleGenAI;
 
@@ -162,6 +168,8 @@ export class MapApp extends LitElement {
     super();
     // Set initial input from a random example prompt
     this.setNewRandomPrompt();
+    // Initialize DB records
+    this.dbRecords = EarthquakeDB.getRecords();
   }
 
   createRenderRoot() {
@@ -688,6 +696,11 @@ You can find this constant near the top of the map_app.ts file.`;
           }
           return b.properties.time - a.properties.time;
         });
+
+        // Automatically ingest into the local top-5 daily database
+        EarthquakeDB.addLiveEarthquakes(data.features);
+        this.dbRecords = EarthquakeDB.getRecords();
+
         await this.plotEarthquakesOnMap();
       }
     } catch (error) {
@@ -773,7 +786,83 @@ You can find this constant near the top of the map_app.ts file.`;
       });
     }
 
-    await this.runDisasterRiskAnalysis(eq);
+    // Check if we already have a pre-saved report for this earthquake
+    const eqId = eq.id || (eq.properties && String(eq.properties.time));
+    const dateStr = this.getUtcDateStr(eq.properties && eq.properties.time);
+    const savedDay = this.dbRecords[dateStr];
+    const savedEq = savedDay ? savedDay.find(s => s.id === eqId) : null;
+
+    if (savedEq && savedEq.report) {
+      this.analysisReport = savedEq.report;
+      this.analysisLoading = false;
+      this.requestUpdate();
+    } else {
+      await this.runDisasterRiskAnalysis(eq);
+    }
+  }
+
+  selectSavedEarthquake(saved: SavedEarthquake) {
+    const eqFeature = {
+      id: saved.id,
+      type: 'Feature',
+      properties: {
+        mag: saved.mag,
+        place: saved.place,
+        time: saved.time,
+        tsunami: saved.tsunami ? 1 : 0
+      },
+      geometry: {
+        type: 'Point',
+        coordinates: saved.coordinates
+      }
+    };
+    
+    // Plot all top-5 earthquakes from this day to make them visually present on the map
+    const records = this.dbRecords;
+    const dateStr = this.getUtcDateStr(saved.time);
+    if (records[dateStr]) {
+      this.earthquakes = records[dateStr].map(s => ({
+        id: s.id,
+        type: 'Feature',
+        properties: {
+          mag: s.mag,
+          place: s.place,
+          time: s.time,
+          tsunami: s.tsunami ? 1 : 0
+        },
+        geometry: {
+          type: 'Point',
+          coordinates: s.coordinates
+        }
+      }));
+      this.plotEarthquakesOnMap();
+    }
+
+    this.selectEarthquake(eqFeature);
+  }
+
+  private getUtcDateStr(time: number): string {
+    const date = new Date(time);
+    const year = date.getUTCFullYear();
+    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(date.getUTCDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+
+  deleteSavedEarthquake(dateStr: string, id: string) {
+    if (confirm('Are you sure you want to delete this earthquake from the database?')) {
+      EarthquakeDB.deleteEarthquake(dateStr, id);
+      this.dbRecords = EarthquakeDB.getRecords();
+      this.requestUpdate();
+    }
+  }
+
+  confirmClearDatabase() {
+    if (confirm('Are you sure you want to clear the entire earthquake database? This cannot be undone.')) {
+      EarthquakeDB.clearDatabase();
+      this.dbRecords = EarthquakeDB.getRecords();
+      this.requestUpdate();
+    }
   }
 
   async _handleAnalyzeEarthquakeQuery(queryStr: string) {
@@ -781,10 +870,30 @@ You can find this constant near the top of the map_app.ts file.`;
       await this.fetchEarthquakes('week');
     }
 
-    const lowerQuery = queryStr.toLowerCase();
-    let match = this.earthquakes.find((eq) => 
-      eq.properties.place.toLowerCase().includes(lowerQuery)
-    );
+    const lowerQuery = queryStr.toLowerCase().trim();
+    let match = null;
+
+    if (
+      lowerQuery === 'latest' ||
+      lowerQuery === 'most recent' ||
+      lowerQuery === 'recent' ||
+      lowerQuery === 'newest' ||
+      lowerQuery === 'last' ||
+      lowerQuery.includes('latest earthquake') ||
+      lowerQuery.includes('most recent earthquake')
+    ) {
+      if (this.earthquakes.length > 0) {
+        match = this.earthquakes.reduce((latest: any, current: any) => 
+          (current.properties.time > latest.properties.time) ? current : latest
+        , this.earthquakes[0]);
+      }
+    }
+
+    if (!match) {
+      match = this.earthquakes.find((eq) => 
+        eq.properties.place.toLowerCase().includes(lowerQuery)
+      );
+    }
 
     if (!match) {
       const magMatch = queryStr.match(/\d+(\.\d+)?/);
@@ -847,7 +956,7 @@ Return your response in a highly professional scientific format using markdown h
 
     try {
       const responseStream = await ai.models.generateContentStream({
-        model: 'gemini-3.5-flash',
+        model: 'gemini-3.6-flash',
         contents: prompt,
       });
 
@@ -861,6 +970,12 @@ Return your response in a highly professional scientific format using markdown h
     } finally {
       this.analysisLoading = false;
       this.requestUpdate();
+
+      // Save the report to the local database automatically
+      if (this.analysisReport && !this.analysisReport.startsWith('An error occurred')) {
+        EarthquakeDB.saveReport(eq, this.analysisReport);
+        this.dbRecords = EarthquakeDB.getRecords();
+      }
     }
   }
 
@@ -1050,6 +1165,20 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
               }
             }}>
             <span>🌍 Live Earthquakes</span>
+          </button>
+          <button
+            id="databaseTab"
+            role="tab"
+            aria-selected=${this.selectedChatTab === ChatTab.DATABASE}
+            aria-controls="database-panel"
+            class=${classMap({
+              'selected-tab': this.selectedChatTab === ChatTab.DATABASE,
+            })}
+            @click=${() => {
+              this.selectedChatTab = ChatTab.DATABASE;
+              this.dbRecords = EarthquakeDB.getRecords();
+            }}>
+            <span>📁 Saved DB</span>
           </button>
         </div>
         <div
@@ -1321,6 +1450,136 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
               Select any earthquake from the list, or click on a 3D epicentral marker on the map to begin disaster risk analysis.
             </div>
           `}
+        </div>
+
+        <div
+          id="database-panel"
+          role="tabpanel"
+          aria-labelledby="databaseTab"
+          class=${classMap({
+            'tabcontent': true,
+            'showtab': this.selectedChatTab === ChatTab.DATABASE,
+            'database-container': true,
+          })}>
+          
+          <div class="db-header">
+            <h3>📁 Saved Top-5 Daily Earthquakes</h3>
+            <p class="db-subtitle">Durable local archive of the day's heaviest seismic events.</p>
+          </div>
+
+          <div class="db-toolbar">
+            <div class="db-search-box">
+              <input 
+                type="text" 
+                placeholder="Search location or date (YYYY-MM-DD)..." 
+                .value=${this.dbSearchQuery}
+                @input=${(e: InputEvent) => { this.dbSearchQuery = (e.target as HTMLInputElement).value; }} />
+              ${this.dbSearchQuery ? html`
+                <button class="db-search-clear" @click=${() => { this.dbSearchQuery = ''; }}>✕</button>
+              ` : ''}
+            </div>
+            ${Object.keys(this.dbRecords).length > 0 ? html`
+              <button class="db-clear-all-btn" @click=${this.confirmClearDatabase}>
+                🧹 Clear DB
+              </button>
+            ` : ''}
+          </div>
+
+          <!-- DB Records List -->
+          <div class="database-list-scroller">
+            ${(() => {
+              const records = this.dbRecords;
+              const dates = Object.keys(records).sort((a, b) => b.localeCompare(a));
+              const query = this.dbSearchQuery.toLowerCase().trim();
+
+              // Filter records
+              const filteredDates = dates.filter(dateStr => {
+                if (!query) return true;
+                if (dateStr.includes(query)) return true;
+                const eqs = records[dateStr];
+                return eqs.some(eq => eq.place.toLowerCase().includes(query));
+              });
+
+              if (dates.length === 0) {
+                return html`
+                  <div class="db-empty-state">
+                    <div class="db-empty-icon">📁</div>
+                    <div class="db-empty-title">Database is empty</div>
+                    <p>Fetch live earthquakes using the <strong>Live Earthquakes</strong> tab or ask Gemini, and the top 5 of each day will automatically save here.</p>
+                  </div>
+                `;
+              }
+
+              if (filteredDates.length === 0) {
+                return html`
+                  <div class="db-empty-state">
+                    No matching records found for "${this.dbSearchQuery}".
+                  </div>
+                `;
+              }
+
+              return filteredDates.map(dateStr => {
+                const eqs = records[dateStr].filter(eq => {
+                  if (!query) return true;
+                  return dateStr.includes(query) || eq.place.toLowerCase().includes(query);
+                });
+
+                if (eqs.length === 0) return '';
+
+                // Format friendly date
+                let friendlyDate = dateStr;
+                try {
+                  const d = new Date(dateStr + 'T00:00:00Z');
+                  friendlyDate = d.toLocaleDateString([], { weekday: 'short', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
+                } catch(e){}
+
+                return html`
+                  <div class="db-day-group">
+                    <div class="db-day-header">
+                      <span class="db-day-date">📅 ${friendlyDate}</span>
+                      <span class="db-day-count">${eqs.length} Saved</span>
+                    </div>
+                    <div class="db-day-cards">
+                      ${eqs.map(eq => {
+                        const mag = eq.mag;
+                        let magColorClass = 'mag-amber';
+                        if (mag >= 6.0) {
+                          magColorClass = 'mag-red';
+                        } else if (mag >= 5.0) {
+                          magColorClass = 'mag-orange';
+                        }
+
+                        const timeStr = new Date(eq.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                        const depth = eq.coordinates[2] || 0;
+
+                        return html`
+                          <div class="db-eq-card" @click=${() => this.selectSavedEarthquake(eq)}>
+                            <div class="db-eq-info">
+                              <div class="db-eq-meta">
+                                <span class="db-eq-mag ${magColorClass}">M ${mag.toFixed(1)}</span>
+                                <span class="db-eq-time">${timeStr} UTC</span>
+                                ${eq.report ? html`<span class="db-eq-report-badge" title="AI Seismological Report is saved offline">📝 Report</span>` : ''}
+                              </div>
+                              <div class="db-eq-place">${eq.place}</div>
+                              <div class="db-eq-depth">Depth: ${depth.toFixed(0)} km</div>
+                            </div>
+                            <div class="db-eq-actions">
+                              <button 
+                                class="db-eq-delete-btn" 
+                                @click=${(e: Event) => { e.stopPropagation(); this.deleteSavedEarthquake(dateStr, eq.id); }} 
+                                title="Delete from Database">
+                                🗑️
+                              </button>
+                            </div>
+                          </div>
+                        `;
+                      })}
+                    </div>
+                  </div>
+                `;
+              });
+            })()}
+          </div>
         </div>
       </div>
     </div>`;
