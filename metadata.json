@@ -1,0 +1,9 @@
+{
+  "name": "Remix: MCP Maps 3D",
+  "description": "Build Photoreal 3D maps with natural language using a Gemini-powered Agent and MCP tools, featuring live earthquake overlays and AI-driven hazard analysis.",
+  "requestFramePermissions": [],
+  "prompt": "",
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
