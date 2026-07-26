@@ -31,6 +31,7 @@ import {GoogleGenAI} from '@google/genai';
 
 import {MapParams} from './mcp_maps_server';
 import {EarthquakeDB, SavedEarthquake} from './earthquake_db';
+import {AsyncSeismologicalAgent, AsyncAnalysisResult} from './async_analysis_agent';
 
 /** Markdown formatting function with syntax hilighting */
 export const marked = new Marked(
@@ -89,7 +90,8 @@ export enum ChatRole {
 // Ensure this key is configured with access to the "Maps JavaScript API",
 // "Geocoding API", and the "Directions API".
 const USER_PROVIDED_GOOGLE_MAPS_API_KEY: string =
-  'AIzaSyAJPTwj4S8isr4b-3NtqVSxk450IAS1lOQ'; // <-- REPLACE THIS WITH YOUR ACTUAL API KEY
+  (process.env as any).GOOGLE_MAPS_API_KEY ||
+  'AIzaSyAJPTwj4S8isr4b-3NtqVSxk450IAS1lOQ';
 
 const EXAMPLE_PROMPTS = [
   "Show me directions from Tokyo Tower to Shibuya Crossing.",
@@ -134,6 +136,9 @@ export class MapApp extends LitElement {
   @state() filterTimeframe = 'day'; // 'day', 'week', 'significant'
   @state() analysisReport = '';
   @state() analysisLoading = false;
+  @state() asyncAgentRunning = false;
+  @state() asyncAgentStep = '';
+  @state() asyncAgentResult: AsyncAnalysisResult | null = null;
 
   // Local Database State
   @state() dbRecords: Record<string, SavedEarthquake[]> = {};
@@ -821,8 +826,17 @@ You can find this constant near the top of the map_app.ts file.`;
     if (savedEq && savedEq.report) {
       this.analysisReport = savedEq.report;
       this.analysisLoading = false;
+      this.asyncAgentResult = {
+        shakeMapPga: savedEq.shakeMapPga,
+        pagerLevel: savedEq.pagerLevel,
+        elevationMeters: savedEq.elevationMeters,
+        aftershockCount: savedEq.aftershockCount,
+        detailedReport: savedEq.report,
+        completedAt: savedEq.time
+      };
       this.requestUpdate();
     } else {
+      this.asyncAgentResult = null;
       await this.runDisasterRiskAnalysis(eq);
     }
   }
@@ -1530,6 +1544,55 @@ Please compare:
     }, 1000);
   }
 
+  renderAsyncAgentStatusCard() {
+    if (!this.asyncAgentRunning && !this.asyncAgentResult && !this.asyncAgentStep) return '';
+
+    const res = this.asyncAgentResult;
+
+    return html`
+      <div class="danger-visualizer-card" style="margin-bottom: 12px; border-color: #3b82f6;">
+        <div class="danger-card-header">
+          <div class="danger-card-title">
+            <h4>🤖 Asynchronous Analytical Agent Flow</h4>
+            <p class="danger-card-sub">Multi-source pipeline: USGS ShakeMap, PAGER, Elevation & Cluster scan</p>
+          </div>
+          ${this.asyncAgentRunning ? html`
+            <span class="recording-pill-live" style="background-color: rgba(59, 130, 246, 0.2); color: #3b82f6; border-color: #3b82f6;">
+              ⚙️ AGENT WORKING...
+            </span>
+          ` : res ? html`
+            <span class="recording-pill-live" style="background-color: rgba(16, 185, 129, 0.2); color: #10b981; border-color: #10b981;">
+              ✓ DATA ENRICHED
+            </span>
+          ` : ''}
+        </div>
+
+        ${this.asyncAgentStep ? html`
+          <div style="font-size: 0.82rem; font-weight: 600; color: var(--color-text); margin: 8px 0; padding: 6px 10px; background-color: var(--color-sidebar-border); border-radius: 6px;">
+            ${this.asyncAgentStep}
+          </div>
+        ` : ''}
+
+        ${res ? html`
+          <div class="danger-zone-legend" style="margin-top: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+            <div class="legend-item" style="font-size: 0.8rem;">
+              ⚡ <strong>Peak Ground Accel (PGA):</strong> ${typeof res.shakeMapPga === 'number' ? `~${res.shakeMapPga}%g` : 'Derived model'}
+            </div>
+            <div class="legend-item" style="font-size: 0.8rem;">
+              🚨 <strong>USGS PAGER Alert:</strong> <span style="text-transform: uppercase; font-weight: bold; color: ${res.pagerLevel === 'red' || res.pagerLevel === 'orange' ? '#ef4444' : res.pagerLevel === 'yellow' ? '#f59e0b' : '#10b981'}">${res.pagerLevel || 'UNRATED'}</span>
+            </div>
+            <div class="legend-item" style="font-size: 0.8rem;">
+              🏔️ <strong>Terrain Elevation:</strong> ${typeof res.elevationMeters === 'number' ? `${res.elevationMeters} m` : 'Sea level / Coast'}
+            </div>
+            <div class="legend-item" style="font-size: 0.8rem;">
+              📡 <strong>30-Day Local Clusters:</strong> ${typeof res.aftershockCount === 'number' ? `${res.aftershockCount} events (100km)` : '0 recorded'}
+            </div>
+          </div>
+        ` : ''}
+      </div>
+    `;
+  }
+
   fallbackVideoRecordingSim() {
     console.log('Using animated WebGL canvas simulation for video capture.');
   }
@@ -1712,62 +1775,52 @@ Please compare:
   async runDisasterRiskAnalysis(eq: any) {
     const ai = this.getAiClient();
     if (!ai) {
-      this.analysisReport = 'Gemini API key is not configured. Please add your key to Secrets.';
+      this.analysisReport = 'Gemini API key is not configured. Please add your key to environment variables.';
       this.requestUpdate();
       return;
     }
 
-    const properties = eq.properties;
-    const coords = eq.geometry.coordinates;
-    const magnitude = properties.mag;
-    const depth = coords[2];
-    const place = properties.place;
-    const tsunamiFlag = properties.tsunami;
-    const sig = properties.sig;
-
     this.analysisLoading = true;
+    this.asyncAgentRunning = true;
+    this.asyncAgentStep = '🚀 Initializing Asynchronous Analytical Agent...';
     this.analysisReport = '';
+    this.asyncAgentResult = null;
     this.requestUpdate();
 
-    const prompt = `You are an expert seismologist and disaster prevention specialist. Analyze the following live earthquake event for disaster potential:
-- Location: ${place}
-- Magnitude: M ${magnitude.toFixed(1)}
-- Depth: ${depth} km
-- Coordinates: Latitude ${coords[1].toFixed(4)}, Longitude ${coords[0].toFixed(4)}
-- USGS Tsunami Alert: ${tsunamiFlag === 1 ? 'Yes, Alert Active' : 'No Active Alert'}
-- USGS Significance Score: ${sig}/1000
-
-Please generate a detailed, highly scannable seismology and disaster risk report.
-Analyze and cover:
-1. **Tsunami Risk**: Calculate tsunami generation risk based on epicentral location (oceanic, coastal, or continental) and magnitude/depth.
-2. **Ground Displacement & Liquefaction**: Assess soil liquefaction hazards in surrounding coastal or alluvial basins and landslides in steep/mountainous slopes.
-3. **Historical context or tectonic context**: e.g., Plate boundary involved (Pacific plate subduction, strike-slip, etc.).
-4. **Disaster Mitigation Advice**: Immediate structural safety, secondary hazard threats (fires, structural collapses, coastal evacuation advice).
-
-Return your response in a highly professional scientific format using markdown headings, bold accents, and clear bullet points. Do not include unrequested technical data (like system coordinates, server details, or port numbers). Keep it focused purely on the seismological hazards and risks.`;
-
     try {
-      const responseStream = await ai.models.generateContentStream({
-        model: 'gemini-3.6-flash',
-        contents: prompt,
-      });
+      const result = await AsyncSeismologicalAgent.runPipeline(
+        eq,
+        ai,
+        (stepMessage) => {
+          this.asyncAgentStep = stepMessage;
+          this.requestUpdate();
+        },
+        (chunkText) => {
+          this.analysisReport += chunkText;
+          this.requestUpdate();
+        }
+      );
 
-      for await (const chunk of responseStream) {
-        this.analysisReport += chunk.text || '';
-        this.requestUpdate();
-      }
-    } catch (error) {
-      console.error('Failed to generate disaster analysis:', error);
-      this.analysisReport = 'An error occurred while generating the AI disaster potential analysis. Please check your API configuration and try again.';
-    } finally {
-      this.analysisLoading = false;
-      this.requestUpdate();
+      this.asyncAgentResult = result;
+      this.asyncAgentStep = '✅ Asynchronous Multi-Source Analysis Complete';
 
-      // Save the report to the local database automatically
+      // Save report and enriched metrics to LocalStorage database
       if (this.analysisReport && !this.analysisReport.startsWith('An error occurred')) {
-        EarthquakeDB.saveReport(eq, this.analysisReport);
+        EarthquakeDB.saveReport(eq, this.analysisReport, {
+          shakeMapPga: result.shakeMapPga,
+          pagerLevel: result.pagerLevel,
+          elevationMeters: result.elevationMeters,
+          aftershockCount: result.aftershockCount,
+        });
         this.dbRecords = EarthquakeDB.getRecords();
       }
+    } catch (error) {
+      console.error('Failed to run asynchronous disaster analysis:', error);
+      this.analysisReport = 'An error occurred during asynchronous analysis. Please check your network and API settings.';
+    } finally {
+      this.analysisLoading = false;
+      this.asyncAgentRunning = false;
+      this.requestUpdate();
     }
   }
 
@@ -2244,6 +2297,9 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
                   })()}
                 </div>
               </div>
+
+              <!-- Asynchronous Analytical Agent Flow Status & Telemetry Card -->
+              ${this.renderAsyncAgentStatusCard()}
 
               <!-- 3D Danger & Shockwave Visualizer Card -->
               ${this.renderDangerVisualizerCard(this.selectedEarthquake)}

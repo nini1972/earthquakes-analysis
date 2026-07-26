@@ -6,6 +6,10 @@ export interface SavedEarthquake {
   tsunami: boolean;
   coordinates: [number, number, number]; // [longitude, latitude, depth]
   report?: string; // Saved Gemini Seismological report
+  shakeMapPga?: number;
+  pagerLevel?: string;
+  elevationMeters?: number;
+  aftershockCount?: number;
 }
 
 export class EarthquakeDB {
@@ -110,7 +114,7 @@ export class EarthquakeDB {
    * Saves or updates a report for a specific earthquake.
    * If it doesn't exist, we add it to that day's list.
    */
-  static saveReport(eqFeature: any, report: string): boolean {
+  static saveReport(eqFeature: any, report: string, extraData?: Partial<SavedEarthquake>): boolean {
     if (!eqFeature || !eqFeature.properties) return false;
     
     const records = this.getRecords();
@@ -134,7 +138,11 @@ export class EarthquakeDB {
 
     const existingIdx = records[dateStr].findIndex(eq => eq.id === id);
     if (existingIdx > -1) {
-      records[dateStr][existingIdx].report = report;
+      records[dateStr][existingIdx] = {
+        ...records[dateStr][existingIdx],
+        report,
+        ...(extraData || {})
+      };
     } else {
       // Add as a new record with the report
       records[dateStr].push({
@@ -144,7 +152,8 @@ export class EarthquakeDB {
         time,
         tsunami,
         coordinates,
-        report
+        report,
+        ...(extraData || {})
       });
       // Sort and keep up to 10 if there are reports, or just sort descending by magnitude
       records[dateStr].sort((a, b) => b.mag - a.mag);
