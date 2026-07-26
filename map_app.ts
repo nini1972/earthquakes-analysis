@@ -147,6 +147,8 @@ export class MapApp extends LitElement {
   // Compare Mode State
   @state() compareMode = false;
   @state() compareSelected: any[] = [];
+  @state() comparisonAiReport = '';
+  @state() comparisonAiLoading = false;
 
   // Danger Zone & Video Recording State
   @state() showDangerZones = false;
@@ -156,6 +158,10 @@ export class MapApp extends LitElement {
   @state() recordingCountdown = 0;
   @state() recordedVideoUrl: string | null = null;
   @state() showVideoModal = false;
+
+  // Saved Report Modal & Accordion State
+  @state() activeReportModal: SavedEarthquake | null = null;
+  @state() collapsedSections: Record<string, boolean> = {};
 
   private dangerZonePolylines: any[] = [];
   private shockwavePolyline?: any;
@@ -1041,7 +1047,7 @@ You can find this constant near the top of the map_app.ts file.`;
     });
   }
 
-  askGeminiToCompare() {
+  async askGeminiToCompare() {
     if (this.compareSelected.length < 2) return;
     const eq1 = this.compareSelected[0];
     const eq2 = this.compareSelected[1];
@@ -1067,7 +1073,33 @@ Please compare:
 - Tsunami, liquefaction, and structural risk differences
 - Recommended disaster response priority`;
 
-    this.selectedChatTab = ChatTab.GEMINI;
+    this.comparisonAiLoading = true;
+    this.comparisonAiReport = '';
+    this.requestUpdate();
+
+    const ai = this.getAiClient();
+    if (ai) {
+      try {
+        const stream = await ai.models.generateContentStream({
+          model: 'gemini-3.6-flash',
+          contents: prompt,
+        });
+        for await (const chunk of stream) {
+          this.comparisonAiReport += chunk.text || '';
+          this.requestUpdate();
+        }
+      } catch (e) {
+        console.error('Comparison AI Error:', e);
+        this.comparisonAiReport = 'Failed to generate inline comparison. See chat log.';
+      } finally {
+        this.comparisonAiLoading = false;
+        this.requestUpdate();
+      }
+    } else {
+      this.comparisonAiLoading = false;
+    }
+
+    // Also send to Gemini Chat tab as a record
     this.sendMessageAction(prompt);
   }
 
@@ -1277,6 +1309,30 @@ Please compare:
             </div>
           </div>
         </div>
+
+        ${this.comparisonAiReport || this.comparisonAiLoading ? html`
+          <div class="narrative-analysis-box" style="margin-top: 14px; border-color: var(--color-sidebar-border);">
+            <div class="narrative-header-row">
+              <h4>✨ Seismological Risk Comparison Report</h4>
+              ${this.comparisonAiReport ? html`
+                <button class="download-report-btn" @click=${() => this.downloadTextReport('earthquake_comparison_report.txt', this.comparisonAiReport)} title="Download Comparison Report">
+                  📥 Download Report
+                </button>
+              ` : ''}
+            </div>
+            ${this.comparisonAiLoading && !this.comparisonAiReport ? html`
+              <div class="shimmer-container">
+                <div class="shimmer-line"></div>
+                <div class="shimmer-line"></div>
+                <div class="shimmer-line"></div>
+              </div>
+            ` : html`
+              <div class="narrative-text">
+                ${this.renderMarkdown(this.comparisonAiReport)}
+              </div>
+            `}
+          </div>
+        ` : ''}
       </div>
     `;
   }
@@ -1461,20 +1517,36 @@ Please compare:
   }
 
   findMapCanvas(): HTMLCanvasElement | null {
-    if (this.mapContainerElement) {
-      let canvas = this.mapContainerElement.querySelector('canvas');
-      if (canvas) return canvas;
-      if (this.mapContainerElement.shadowRoot) {
-        canvas = this.mapContainerElement.shadowRoot.querySelector('canvas');
-        if (canvas) return canvas;
+    const searchShadow = (node: Node | null): HTMLCanvasElement | null => {
+      if (!node) return null;
+      if (node instanceof HTMLCanvasElement) return node;
+      
+      if (node.childNodes) {
+        for (const child of Array.from(node.childNodes)) {
+          const found = searchShadow(child);
+          if (found) return found;
+        }
       }
-    }
+      
+      if (node instanceof HTMLElement && node.shadowRoot) {
+        for (const child of Array.from(node.shadowRoot.childNodes)) {
+          const found = searchShadow(child);
+          if (found) return found;
+        }
+      }
+      return null;
+    };
+
+    const found = searchShadow(this.mapContainerElement || null);
+    if (found) return found;
+
     const allCanvases = Array.from(document.querySelectorAll('canvas'));
     return allCanvases[0] || null;
   }
 
   async startDangerVideoRecording(eq: any) {
     if (!eq) return;
+
     this.clearDangerZones();
     this.renderDangerZonesOnMap(eq);
     this.startShockwaveAnimation(eq);
@@ -1485,60 +1557,192 @@ Please compare:
     this.recordedVideoUrl = null;
     this.recordedChunks = [];
 
-    const canvas = this.findMapCanvas();
-    let stream: MediaStream | null = null;
+    // Create an in-app offscreen recording canvas (800x450)
+    const recCanvas = document.createElement('canvas');
+    recCanvas.width = 800;
+    recCanvas.height = 450;
+    const ctx = recCanvas.getContext('2d');
 
-    if (canvas && typeof (canvas as any).captureStream === 'function') {
-      try {
-        stream = (canvas as any).captureStream(30);
-      } catch (e) {
-        console.warn('Canvas captureStream error:', e);
-      }
+    if (!ctx) {
+      console.warn('Canvas 2D context unavailable for video recording.');
+      this.isRecordingVideo = false;
+      return;
     }
 
-    if (stream && typeof MediaRecorder !== 'undefined') {
-      try {
-        let mimeType = 'video/webm';
-        if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
-          mimeType = 'video/webm;codecs=vp9';
-        } else if (MediaRecorder.isTypeSupported('video/mp4')) {
-          mimeType = 'video/mp4';
+    const mapCanvas = this.findMapCanvas();
+    const coords = eq.geometry ? eq.geometry.coordinates : eq.coordinates;
+    const place = eq.properties?.place || eq.place || 'Unknown Location';
+    const mag = typeof (eq.properties?.mag) === 'number' ? eq.properties.mag : (eq.mag || 0);
+    const depth = coords ? coords[2] : 10;
+    const dateStr = this.getUtcDateStr(eq.properties?.time || eq.time);
+
+    let progress = 0;
+    const totalFrames = 180; // 6 seconds @ 30 FPS
+    let frameCount = 0;
+
+    // Capture stream directly from in-app canvas (NO OS screen share picker required!)
+    const stream = recCanvas.captureStream(30);
+
+    let mimeType = 'video/webm';
+    if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+      mimeType = 'video/webm;codecs=vp9';
+    } else if (MediaRecorder.isTypeSupported('video/webm')) {
+      mimeType = 'video/webm';
+    } else if (MediaRecorder.isTypeSupported('video/mp4')) {
+      mimeType = 'video/mp4';
+    }
+
+    try {
+      this.mediaRecorder = new MediaRecorder(stream, { mimeType });
+      this.mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          this.recordedChunks.push(event.data);
+        }
+      };
+
+      this.mediaRecorder.onstop = () => {
+        const blob = new Blob(this.recordedChunks, { type: mimeType });
+        if (blob.size > 0) {
+          this.recordedVideoUrl = URL.createObjectURL(blob);
+
+          const safePlace = place.replace(/[^a-z0-9]/gi, '_').replace(/_{2,}/g, '_').toLowerCase();
+          const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
+          const filename = `earthquake-danger-simulation-${safePlace}.${ext}`;
+
+          const link = document.createElement('a');
+          link.href = this.recordedVideoUrl;
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
         }
 
-        this.mediaRecorder = new MediaRecorder(stream, { mimeType });
-        this.mediaRecorder.ondataavailable = (event) => {
-          if (event.data && event.data.size > 0) {
-            this.recordedChunks.push(event.data);
-          }
-        };
+        this.isRecordingVideo = false;
+        this.showVideoModal = true;
+        this.stopShockwaveAnimation();
+        this.requestUpdate();
+      };
 
-        this.mediaRecorder.onstop = () => {
-          const blob = new Blob(this.recordedChunks, { type: mimeType });
-          this.recordedVideoUrl = URL.createObjectURL(blob);
-          this.isRecordingVideo = false;
-          this.showVideoModal = true;
-          this.stopShockwaveAnimation();
-          this.requestUpdate();
-        };
-
-        this.mediaRecorder.start();
-      } catch (e) {
-        console.warn('MediaRecorder error:', e);
-        this.fallbackVideoRecordingSim();
-      }
-    } else {
-      this.fallbackVideoRecordingSim();
+      this.mediaRecorder.start(100);
+    } catch (e) {
+      console.error('In-App MediaRecorder start error:', e);
+      this.isRecordingVideo = false;
+      this.stopShockwaveAnimation();
+      return;
     }
+
+    // Frame rendering loop (30 FPS)
+    const animInterval = setInterval(() => {
+      frameCount++;
+      progress = (frameCount / totalFrames) * 100;
+
+      // Dark slate base canvas
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(0, 0, recCanvas.width, recCanvas.height);
+
+      // Attempt to composite live WebGL map canvas if accessible
+      if (mapCanvas) {
+        try {
+          ctx.drawImage(mapCanvas, 0, 0, recCanvas.width, recCanvas.height);
+        } catch (e) {
+          // WebGL buffer cleared, proceed with vector HUD composite
+        }
+      }
+
+      // Draw Grid Lines
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.lineWidth = 1;
+      for (let x = 0; x < recCanvas.width; x += 40) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, recCanvas.height); ctx.stroke();
+      }
+      for (let y = 0; y < recCanvas.height; y += 40) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(recCanvas.width, y); ctx.stroke();
+      }
+
+      const cx = recCanvas.width / 2;
+      const cy = recCanvas.height / 2 + 10;
+
+      // Draw Expanding Shockwave Rings
+      const waveRadius = (progress / 100) * 260;
+
+      // Light Shaking (Yellow)
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(10, waveRadius), 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(245, 158, 11, 0.8)';
+      ctx.lineWidth = 4;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(245, 158, 11, 0.1)';
+      ctx.fill();
+
+      // Moderate Shaking (Orange)
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(5, waveRadius * 0.65), 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(249, 115, 22, 0.9)';
+      ctx.lineWidth = 6;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(249, 115, 22, 0.2)';
+      ctx.fill();
+
+      // Heavy Core Shaking (Red)
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(3, waveRadius * 0.35), 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(239, 68, 68, 1.0)';
+      ctx.lineWidth = 8;
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(239, 68, 68, 0.35)';
+      ctx.fill();
+
+      // Epicenter Marker
+      ctx.beginPath();
+      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.fillStyle = '#ef4444';
+      ctx.fill();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      // Top Header Telemetry HUD
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      ctx.fillRect(0, 0, recCanvas.width, 54);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 15px sans-serif';
+      ctx.fillText(`🌍 3D DANGER SIMULATION: M${mag.toFixed(1)} - ${place}`, 16, 24);
+
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '12px sans-serif';
+      ctx.fillText(`UTC: ${dateStr} | Depth: ${depth}km | Wave Expansion: ${Math.round(progress)}%`, 16, 44);
+
+      // Bottom Telemetry Badge
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+      ctx.fillRect(16, recCanvas.height - 75, 280, 60);
+      ctx.strokeStyle = '#3b82f6';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(16, recCanvas.height - 75, 280, 60);
+
+      ctx.fillStyle = '#ef4444';
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillText(`🚨 MMI VIII+ Heavy Shaking Core`, 26, recCanvas.height - 55);
+      ctx.fillStyle = '#cbd5e1';
+      ctx.font = '11px sans-serif';
+      ctx.fillText(`PGA Accel: ~${(mag * 7.5).toFixed(1)}%g | Status: REC 🔴`, 26, recCanvas.height - 35);
+
+      // Countdown in Top Right
+      ctx.fillStyle = '#ef4444';
+      ctx.font = 'bold 13px sans-serif';
+      ctx.fillText(`🔴 REC ${this.recordingCountdown}s`, recCanvas.width - 90, 32);
+
+      if (frameCount >= totalFrames) {
+        clearInterval(animInterval);
+        if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+          this.mediaRecorder.stop();
+        }
+      }
+    }, 1000 / 30);
 
     const timer = setInterval(() => {
       this.recordingCountdown -= 1;
       if (this.recordingCountdown <= 0) {
         clearInterval(timer);
-        if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-          this.mediaRecorder.stop();
-        } else {
-          this.finishSimulatedVideoRecording();
-        }
       }
       this.requestUpdate();
     }, 1000);
@@ -1625,7 +1829,7 @@ Please compare:
           <button 
             class="danger-btn ${this.showDangerZones ? 'active' : ''}" 
             @click=${() => this.toggleDangerZones(eq)}>
-            ${this.showDangerZones ? '⭕ Hide Hazard Rings' : '⭕ Draw Hazard Rings'}
+            ${this.showDangerZones ? '⭕ Hide Rings' : '⭕ Hazard Rings'}
           </button>
 
           <button 
@@ -1637,7 +1841,8 @@ Please compare:
           <button 
             class="danger-btn primary-record" 
             ?disabled=${this.isRecordingVideo}
-            @click=${() => this.startDangerVideoRecording(eq)}>
+            @click=${() => this.startDangerVideoRecording(eq)}
+            title="Export animated 3D hazard video simulation">
             🎥 Record & Export Video
           </button>
 
@@ -1678,6 +1883,61 @@ Please compare:
     `;
   }
 
+  renderReportModal() {
+    if (!this.activeReportModal) return '';
+
+    const eq = this.activeReportModal;
+    const mag = typeof eq.mag === 'number' ? eq.mag.toFixed(1) : '?.?';
+    const place = eq.place || 'Unknown Location';
+    const dateStr = this.getUtcDateStr(eq.time);
+
+    let magColorClass = 'mag-amber';
+    if (eq.mag >= 6.0) magColorClass = 'mag-red';
+    else if (eq.mag >= 5.0) magColorClass = 'mag-orange';
+
+    return html`
+      <div class="video-modal-backdrop" @click=${() => { this.activeReportModal = null; this.requestUpdate(); }}>
+        <div class="video-modal-content" style="max-width: 680px;" @click=${(e: Event) => e.stopPropagation()}>
+          <div class="video-modal-header">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span class="eq-mag-badge ${magColorClass}">M ${mag}</span>
+              <h3 style="margin: 0; font-size: 1.1rem; line-height: 1.3;">${place}</h3>
+            </div>
+            <button class="modal-close-btn" @click=${() => { this.activeReportModal = null; this.requestUpdate(); }}>✕</button>
+          </div>
+          <div class="video-modal-body" style="max-height: 70vh; overflow-y: auto;">
+            <div style="font-size: 0.8rem; opacity: 0.8; margin-bottom: 10px;">
+              📅 UTC Event Date: <strong>${dateStr}</strong> | Depth: <strong>${eq.coordinates[2]} km</strong> | Tsunami Alert: <strong>${eq.tsunami ? 'YES' : 'No'}</strong>
+            </div>
+
+            ${eq.shakeMapPga || eq.elevationMeters || eq.aftershockCount ? html`
+              <div class="danger-zone-legend" style="margin-bottom: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; background-color: var(--color-sidebar-border); padding: 10px; border-radius: 8px;">
+                <div class="legend-item">⚡ <strong>PGA:</strong> ${typeof eq.shakeMapPga === 'number' ? `~${eq.shakeMapPga}%g` : 'N/A'}</div>
+                <div class="legend-item">🚨 <strong>PAGER Alert:</strong> ${eq.pagerLevel ? eq.pagerLevel.toUpperCase() : 'N/A'}</div>
+                <div class="legend-item">🏔️ <strong>Elevation:</strong> ${typeof eq.elevationMeters === 'number' ? `${eq.elevationMeters} m` : 'N/A'}</div>
+                <div class="legend-item">📡 <strong>30d Clusters:</strong> ${eq.aftershockCount ?? 'N/A'} events</div>
+              </div>
+            ` : ''}
+
+            <div class="narrative-text">
+              ${eq.report ? this.renderMarkdown(eq.report) : html`<em>No saved report text available for this earthquake.</em>`}
+            </div>
+          </div>
+          <div class="video-modal-footer">
+            ${eq.report ? html`
+              <button class="v-btn download primary" @click=${() => this.downloadTextReport(`saved_report_M${mag}_${dateStr}.txt`, eq.report || '')}>
+                📥 Download Report .TXT
+              </button>
+            ` : ''}
+            <button class="v-btn" @click=${() => { this.activeReportModal = null; this.requestUpdate(); }}>
+              Close
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   renderVideoModal() {
     if (!this.showVideoModal) return '';
 
@@ -1693,6 +1953,9 @@ Please compare:
             <button class="modal-close-btn" @click=${() => { this.showVideoModal = false; this.requestUpdate(); }}>✕</button>
           </div>
           <div class="video-modal-body">
+            <div style="font-size: 0.8rem; background-color: rgba(16, 185, 129, 0.15); border: 1px solid #10b981; color: #10b981; padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;">
+              <span>✅ <strong>Video Recorded & Downloaded!</strong> Saved to your device's <strong>Downloads</strong> folder as a <code>.webm</code> file.</span>
+            </div>
             ${this.recordedVideoUrl ? html`
               <video src=${this.recordedVideoUrl} controls autoplay loop class="recorded-video-player"></video>
             ` : html`
@@ -1707,8 +1970,8 @@ Please compare:
           </div>
           <div class="video-modal-footer">
             ${this.recordedVideoUrl ? html`
-              <a class="v-btn download primary" href=${this.recordedVideoUrl} download="earthquake-danger-video-${eq?.id || 'sim'}.webm">
-                📥 Download .WebM Video
+              <a class="v-btn download primary" href=${this.recordedVideoUrl} download="earthquake-danger-simulation-${eq?.id || 'event'}.webm">
+                📥 Re-download .WebM Video
               </a>
             ` : ''}
             <button class="v-btn" @click=${() => { this.showVideoModal = false; this.requestUpdate(); }}>
@@ -1881,6 +2144,73 @@ Please compare:
     } catch (e) {
       return text;
     }
+  }
+
+  toggleSectionCollapse(sectionId: string) {
+    this.collapsedSections = {
+      ...this.collapsedSections,
+      [sectionId]: !this.collapsedSections[sectionId]
+    };
+    this.requestUpdate();
+  }
+
+  exportDatabaseBackup() {
+    const records = EarthquakeDB.getRecords();
+    const jsonStr = JSON.stringify(records, null, 2);
+    const blob = new Blob([jsonStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `earthquakes_database_backup_${new Date().toISOString().split('T')[0]}.json`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
+
+  importDatabaseBackup() {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'application/json';
+    input.onchange = (e: Event) => {
+      const file = (e.target as HTMLInputElement).files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        try {
+          const parsed = JSON.parse(event.target?.result as string);
+          if (parsed && typeof parsed === 'object') {
+            const current = EarthquakeDB.getRecords();
+            for (const key of Object.keys(parsed)) {
+              if (Array.isArray(parsed[key])) {
+                current[key] = parsed[key];
+              }
+            }
+            EarthquakeDB.saveRecords(current);
+            this.dbRecords = EarthquakeDB.getRecords();
+            this.requestUpdate();
+            alert('✅ Earthquake Database successfully imported and restored!');
+          }
+        } catch (err) {
+          alert('Failed to parse database backup file. Please select a valid JSON backup.');
+        }
+      };
+      reader.readAsText(file);
+    };
+    input.click();
+  }
+
+  downloadTextReport(filename: string, content: string) {
+    if (!content) return;
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   }
 
   downloadReport() {
@@ -2237,95 +2567,102 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
           ${this.selectedEarthquake && !this.compareMode ? html`
             <div class="eq-analysis-panel">
               <div class="eq-analysis-title-bar">
-                <h3>🌋 Risk & Disaster Analysis</h3>
-                <button class="eq-analysis-close" @click=${() => { this.selectedEarthquake = null; this.requestUpdate(); }}>✕</button>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <button class="eq-analysis-close" @click=${() => { this.selectedEarthquake = null; this.requestUpdate(); }} title="Back to List">
+                    ← Back
+                  </button>
+                  <h3 style="margin: 0; font-size: 0.95rem;">🌋 Risk & Disaster Analysis</h3>
+                </div>
+                <button class="eq-analysis-close" @click=${() => { this.selectedEarthquake = null; this.requestUpdate(); }} title="Close">✕</button>
               </div>
 
-              <!-- Header meta of selected eq -->
-              <div class="selected-eq-header">
-                <div class="selected-eq-title">${this.selectedEarthquake.properties.place}</div>
-                <div class="selected-eq-details">
-                  <span>Magnitude: <strong>M ${this.selectedEarthquake.properties.mag?.toFixed(1)}</strong></span> |
-                  <span>Depth: <strong>${this.selectedEarthquake.geometry.coordinates[2]?.toFixed(0)} km</strong></span> |
-                  <span>Coordinates: <strong>${this.selectedEarthquake.geometry.coordinates[1]?.toFixed(3)}°, ${this.selectedEarthquake.geometry.coordinates[0]?.toFixed(3)}°</strong></span>
-                </div>
-              </div>
-
-              <!-- Realtime Risk meters (heuristics) -->
-              <div class="risk-meters-container">
-                <h4>Dynamic Hazard Indicators</h4>
-                <div class="risk-grid">
-                  ${(() => {
-                    const metrics = this.calculateHeuristicMetrics(this.selectedEarthquake);
-                    return html`
-                      <!-- Tsunami risk meter -->
-                      <div class="risk-meter-item">
-                        <div class="risk-meter-lbl">🌊 Tsunami Risk</div>
-                        <div class="risk-progress-bg">
-                          <div class="risk-progress-bar ${metrics.tsunami > 75 ? 'bg-danger' : metrics.tsunami > 40 ? 'bg-warning' : 'bg-success'}" style="width: ${metrics.tsunami}%"></div>
-                        </div>
-                        <div class="risk-meter-val">${metrics.tsunami}%</div>
-                      </div>
-
-                      <!-- Soil Liquefaction meter -->
-                      <div class="risk-meter-item">
-                        <div class="risk-meter-lbl">💧 Liquefaction Hazard</div>
-                        <div class="risk-progress-bg">
-                          <div class="risk-progress-bar ${metrics.liquefaction > 70 ? 'bg-danger' : metrics.liquefaction > 40 ? 'bg-warning' : 'bg-success'}" style="width: ${metrics.liquefaction}%"></div>
-                        </div>
-                        <div class="risk-meter-val">${metrics.liquefaction}%</div>
-                      </div>
-
-                      <!-- Landslide meter -->
-                      <div class="risk-meter-item">
-                        <div class="risk-meter-lbl">⛰️ Landslide Hazard</div>
-                        <div class="risk-progress-bg">
-                          <div class="risk-progress-bar ${metrics.landslide > 70 ? 'bg-danger' : metrics.landslide > 40 ? 'bg-warning' : 'bg-success'}" style="width: ${metrics.landslide}%"></div>
-                        </div>
-                        <div class="risk-meter-val">${metrics.landslide}%</div>
-                      </div>
-
-                      <!-- Structural collapse risk meter -->
-                      <div class="risk-meter-item">
-                        <div class="risk-meter-lbl">🏢 Structural Failure</div>
-                        <div class="risk-progress-bg">
-                          <div class="risk-progress-bar ${metrics.structural > 70 ? 'bg-danger' : metrics.structural > 40 ? 'bg-warning' : 'bg-success'}" style="width: ${metrics.structural}%"></div>
-                        </div>
-                        <div class="risk-meter-val">${metrics.structural}%</div>
-                      </div>
-                    `;
-                  })()}
-                </div>
-              </div>
-
-              <!-- Asynchronous Analytical Agent Flow Status & Telemetry Card -->
-              ${this.renderAsyncAgentStatusCard()}
-
-              <!-- 3D Danger & Shockwave Visualizer Card -->
-              ${this.renderDangerVisualizerCard(this.selectedEarthquake)}
-
-              <!-- Narrative report from Gemini -->
-              <div class="narrative-analysis-box">
-                <div class="narrative-header-row">
-                  <h4>Seismological Assessment Report</h4>
-                  ${this.analysisReport ? html`
-                    <button class="download-report-btn" @click=${this.downloadReport} title="Download Assessment Report">
-                      📥 Download Report
-                    </button>
-                  ` : ''}
-                </div>
-                ${this.analysisLoading && !this.analysisReport ? html`
-                  <div class="shimmer-container">
-                    <div class="shimmer-line"></div>
-                    <div class="shimmer-line"></div>
-                    <div class="shimmer-line"></div>
+              <div class="eq-analysis-panel-body">
+                <!-- Header meta of selected eq -->
+                <div class="selected-eq-header">
+                  <div class="selected-eq-title">${this.selectedEarthquake.properties.place}</div>
+                  <div class="selected-eq-details">
+                    <span>Magnitude: <strong>M ${this.selectedEarthquake.properties.mag?.toFixed(1)}</strong></span> |
+                    <span>Depth: <strong>${this.selectedEarthquake.geometry.coordinates[2]?.toFixed(0)} km</strong></span> |
+                    <span>Coordinates: <strong>${this.selectedEarthquake.geometry.coordinates[1]?.toFixed(3)}°, ${this.selectedEarthquake.geometry.coordinates[0]?.toFixed(3)}°</strong></span>
                   </div>
-                ` : html`
-                  <div class="narrative-text">
-                    ${this.analysisReport ? this.renderMarkdown(this.analysisReport) : html`Requesting detailed scientific assessment from Gemini...`}
+                </div>
+
+                <!-- Realtime Risk meters (heuristics) -->
+                <div class="risk-meters-container">
+                  <h4>Dynamic Hazard Indicators</h4>
+                  <div class="risk-grid">
+                    ${(() => {
+                      const metrics = this.calculateHeuristicMetrics(this.selectedEarthquake);
+                      return html`
+                        <!-- Tsunami risk meter -->
+                        <div class="risk-meter-item">
+                          <div class="risk-meter-lbl">🌊 Tsunami Risk</div>
+                          <div class="risk-progress-bg">
+                            <div class="risk-progress-bar ${metrics.tsunami > 75 ? 'bg-danger' : metrics.tsunami > 40 ? 'bg-warning' : 'bg-success'}" style="width: ${metrics.tsunami}%"></div>
+                          </div>
+                          <div class="risk-meter-val">${metrics.tsunami}%</div>
+                        </div>
+
+                        <!-- Soil Liquefaction meter -->
+                        <div class="risk-meter-item">
+                          <div class="risk-meter-lbl">💧 Liquefaction Hazard</div>
+                          <div class="risk-progress-bg">
+                            <div class="risk-progress-bar ${metrics.liquefaction > 70 ? 'bg-danger' : metrics.liquefaction > 40 ? 'bg-warning' : 'bg-success'}" style="width: ${metrics.liquefaction}%"></div>
+                          </div>
+                          <div class="risk-meter-val">${metrics.liquefaction}%</div>
+                        </div>
+
+                        <!-- Landslide meter -->
+                        <div class="risk-meter-item">
+                          <div class="risk-meter-lbl">⛰️ Landslide Hazard</div>
+                          <div class="risk-progress-bg">
+                            <div class="risk-progress-bar ${metrics.landslide > 70 ? 'bg-danger' : metrics.landslide > 40 ? 'bg-warning' : 'bg-success'}" style="width: ${metrics.landslide}%"></div>
+                          </div>
+                          <div class="risk-meter-val">${metrics.landslide}%</div>
+                        </div>
+
+                        <!-- Structural collapse risk meter -->
+                        <div class="risk-meter-item">
+                          <div class="risk-meter-lbl">🏢 Structural Failure</div>
+                          <div class="risk-progress-bg">
+                            <div class="risk-progress-bar ${metrics.structural > 70 ? 'bg-danger' : metrics.structural > 40 ? 'bg-warning' : 'bg-success'}" style="width: ${metrics.structural}%"></div>
+                          </div>
+                          <div class="risk-meter-val">${metrics.structural}%</div>
+                        </div>
+                      `;
+                    })()}
                   </div>
-                `}
-                ${this.analysisLoading && this.analysisReport ? html`<div class="narrative-typing-indicator">✍️ AI writing report...</div>` : ''}
+                </div>
+
+                <!-- Asynchronous Analytical Agent Flow Status & Telemetry Card -->
+                ${this.renderAsyncAgentStatusCard()}
+
+                <!-- 3D Danger & Shockwave Visualizer Card -->
+                ${this.renderDangerVisualizerCard(this.selectedEarthquake)}
+
+                <!-- Narrative report from Gemini -->
+                <div class="narrative-analysis-box">
+                  <div class="narrative-header-row">
+                    <h4>Seismological Assessment Report</h4>
+                    ${this.analysisReport ? html`
+                      <button class="download-report-btn" @click=${this.downloadReport} title="Download Assessment Report">
+                        📥 Download Report
+                      </button>
+                    ` : ''}
+                  </div>
+                  ${this.analysisLoading && !this.analysisReport ? html`
+                    <div class="shimmer-container">
+                      <div class="shimmer-line"></div>
+                      <div class="shimmer-line"></div>
+                      <div class="shimmer-line"></div>
+                    </div>
+                  ` : html`
+                    <div class="narrative-text">
+                      ${this.analysisReport ? this.renderMarkdown(this.analysisReport) : html`Requesting detailed scientific assessment from Gemini...`}
+                    </div>
+                  `}
+                  ${this.analysisLoading && this.analysisReport ? html`<div class="narrative-typing-indicator">✍️ AI writing report...</div>` : ''}
+                </div>
               </div>
             </div>
           ` : html`
@@ -2365,6 +2702,12 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
               class="eq-compare-toggle-btn ${this.compareMode ? 'active' : ''}"
               @click=${() => this.toggleCompareMode()}>
               ⚖️ Compare ${this.compareSelected.length > 0 ? `(${this.compareSelected.length}/2)` : ''}
+            </button>
+            <button class="eq-filter-btn" @click=${this.exportDatabaseBackup} title="Export database to JSON file">
+              📤 Backup
+            </button>
+            <button class="eq-filter-btn" @click=${this.importDatabaseBackup} title="Import database from JSON file">
+              📥 Restore
             </button>
             ${Object.keys(this.dbRecords).length > 0 ? html`
               <button class="db-clear-all-btn" @click=${this.confirmClearDatabase}>
@@ -2473,7 +2816,15 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
                                 ` : ''}
                                 <span class="db-eq-mag ${magColorClass}">M ${mag.toFixed(1)}</span>
                                 <span class="db-eq-time">${timeStr} UTC</span>
-                                ${eq.report ? html`<span class="db-eq-report-badge" title="AI Seismological Report is saved offline">📝 Report</span>` : ''}
+                                ${eq.report ? html`
+                                  <button 
+                                    class="db-eq-report-badge" 
+                                    style="border: none; cursor: pointer;"
+                                    @click=${(e: Event) => { e.stopPropagation(); this.activeReportModal = eq; this.requestUpdate(); }}
+                                    title="Click to view full saved AI report">
+                                    📝 View Report
+                                  </button>
+                                ` : ''}
                               </div>
                               <div class="db-eq-place">${eq.place}</div>
                               <div class="db-eq-depth">Depth: ${depth.toFixed(0)} km</div>
@@ -2498,6 +2849,7 @@ Report generated on ${currentDate} via Remix: MCP Maps 3D
         </div>
       </div>
       ${this.renderVideoModal()}
+      ${this.renderReportModal()}
     </div>`;
   }
 }

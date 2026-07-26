@@ -92,15 +92,23 @@ export class EarthquakeDB {
       updatedDaysSet.add(dateStr);
     }
 
-    // For all updated days, sort descending by magnitude and keep only the top 5
+    // For all updated days, preserve all records with saved reports, plus top live events
     for (const dateStr of updatedDaysSet) {
-      records[dateStr].sort((a, b) => b.mag - a.mag);
-      if (records[dateStr].length > 5) {
-        // Keep any record that already has a report, even if it falls out of top 5
-        // Or if we must slice to 5, we make sure we don't discard ones with reports if possible,
-        // but to keep it simple, we just slice the sorted list.
-        records[dateStr] = records[dateStr].slice(0, 5);
+      const withReports = records[dateStr].filter(eq => !!eq.report);
+      const withoutReports = records[dateStr].filter(eq => !eq.report);
+      withoutReports.sort((a, b) => b.mag - a.mag);
+      
+      const maxWithoutReports = Math.max(0, 5 - withReports.length);
+      const keptWithoutReports = withoutReports.slice(0, Math.max(maxWithoutReports, 5));
+      
+      const combinedMap = new Map<string, SavedEarthquake>();
+      for (const item of [...withReports, ...keptWithoutReports]) {
+        combinedMap.set(item.id, item);
       }
+      
+      const combinedList = Array.from(combinedMap.values());
+      combinedList.sort((a, b) => b.mag - a.mag);
+      records[dateStr] = combinedList;
     }
 
     this.saveRecords(records);
