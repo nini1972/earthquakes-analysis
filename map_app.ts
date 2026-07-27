@@ -1576,6 +1576,23 @@ Please compare:
     const depth = coords ? coords[2] : 10;
     const dateStr = this.getUtcDateStr(eq.properties?.time || eq.time);
 
+    // Load high-resolution satellite terrain basemap for epicenter
+    const mapImg = new Image();
+    mapImg.crossOrigin = 'anonymous';
+    let mapImgLoaded = false;
+    mapImg.onload = () => { mapImgLoaded = true; };
+
+    const apiKey = (process.env as any).GOOGLE_MAPS_API_KEY || '';
+    const lat = coords ? coords[1] : 0;
+    const lng = coords ? coords[0] : 0;
+
+    if (apiKey) {
+      mapImg.src = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=8&size=800x450&scale=2&maptype=hybrid&key=${apiKey}`;
+    } else {
+      // Free CORS-friendly Esri World Imagery satellite map snapshot
+      mapImg.src = `https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/export?bbox=${lng - 1.2},${lat - 0.7},${lng + 1.2},${lat + 0.7}&bboxSR=4326&imageSR=4326&size=800,450&f=image`;
+    }
+
     let progress = 0;
     const totalFrames = 180; // 6 seconds @ 30 FPS
     let frameCount = 0;
@@ -1640,13 +1657,18 @@ Please compare:
       ctx.fillStyle = '#0f172a';
       ctx.fillRect(0, 0, recCanvas.width, recCanvas.height);
 
-      // Attempt to composite live WebGL map canvas if accessible
-      if (mapCanvas) {
+      // 1. Draw Satellite Map Background
+      if (mapImgLoaded && mapImg.complete && mapImg.naturalWidth > 0) {
+        try {
+          ctx.drawImage(mapImg, 0, 0, recCanvas.width, recCanvas.height);
+          // Dark overlay tint for high contrast UI readability
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.35)';
+          ctx.fillRect(0, 0, recCanvas.width, recCanvas.height);
+        } catch (e) {}
+      } else if (mapCanvas) {
         try {
           ctx.drawImage(mapCanvas, 0, 0, recCanvas.width, recCanvas.height);
-        } catch (e) {
-          // WebGL buffer cleared, proceed with vector HUD composite
-        }
+        } catch (e) {}
       }
 
       // Draw Grid Lines
