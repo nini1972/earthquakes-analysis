@@ -1661,31 +1661,112 @@ Please compare:
     const lat = coords ? coords[1] : 0;
     const lng = coords ? coords[0] : 0;
 
-    // --- Robust satellite terrain loading with await + timeout fallback ---
-    const loadSatelliteImage = (): Promise<HTMLImageElement | null> => {
+    // --- Robust satellite terrain: Google Static Maps primary, Esri tiles fallback ---
+    const loadImageWithTimeout = (url: string, timeoutMs: number, useCors: boolean): Promise<HTMLImageElement | null> => {
       return new Promise((resolve) => {
         const img = new Image();
-        img.crossOrigin = 'anonymous';
+        if (useCors) img.crossOrigin = 'anonymous';
 
-        const timeout = setTimeout(() => {
-          console.warn('Satellite image load timeout — falling back to map canvas.');
-          resolve(null);
-        }, 3500);
+        const timer = setTimeout(() => { resolve(null); }, timeoutMs);
 
-        img.onload = () => { clearTimeout(timeout); resolve(img); };
-        img.onerror = () => { clearTimeout(timeout); resolve(null); };
-
-        const apiKey = (process.env as any).GOOGLE_MAPS_API_KEY || '';
-        if (apiKey) {
-          img.src = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=8&size=800x450&scale=2&maptype=hybrid&key=${apiKey}`;
-        } else {
-          // Esri World Imagery — CORS-friendly, no API key needed
-          img.src = `https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/export?bbox=${lng - 1.5},${lat - 0.85},${lng + 1.5},${lat + 0.85}&bboxSR=4326&imageSR=4326&size=800,450&format=png&f=image`;
-        }
+        img.onload = () => { clearTimeout(timer); resolve(img); };
+        img.onerror = () => { clearTimeout(timer); resolve(null); };
+        img.src = url;
       });
     };
 
-    const satelliteImg = await loadSatelliteImage();
+    let satelliteComposite: HTMLCanvasElement | null = null;
+
+    // 1) PRIMARY: Google Static Maps API — use fetch() to verify HTTP 200 first
+    const apiKey = USER_PROVIDED_GOOGLE_MAPS_API_KEY || '';
+    const hasApiKey = apiKey && apiKey !== 'YOUR_ACTUAL_GOOGLE_MAPS_API_KEY_REPLACE_ME';
+
+    if (hasApiKey) {
+      try {
+        const googleUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=8&size=800x450&scale=2&maptype=hybrid&key=${apiKey}`;
+        const controller = new AbortController();
+        const fetchTimeout = setTimeout(() => controller.abort(), 5000);
+
+        const response = await fetch(googleUrl, { signal: controller.signal });
+        clearTimeout(fetchTimeout);
+
+        if (response.ok && response.headers.get('content-type')?.includes('image')) {
+          const blob = await response.blob();
+          const blobUrl = URL.createObjectURL(blob);
+          const googleImg = await loadImageWithTimeout(blobUrl, 3000, false);
+
+          if (googleImg && googleImg.naturalWidth >= 400) {
+            const gCanvas = document.createElement('canvas');
+            gCanvas.width = 800;
+            gCanvas.height = 450;
+            const gCtx = gCanvas.getContext('2d');
+            if (gCtx) {
+              gCtx.drawImage(googleImg, 0, 0, 800, 450);
+              satelliteComposite = gCanvas;
+              console.log(`Satellite terrain: Google Static Maps loaded ✓ (${googleImg.naturalWidth}x${googleImg.naturalHeight})`);
+            }
+          }
+          URL.revokeObjectURL(blobUrl);
+        } else {
+          console.warn(`Google Static Maps API error: HTTP ${response.status} — falling back to Esri tiles`);
+        }
+      } catch (e) {
+        console.warn('Google Static Maps fetch failed:', e);
+      }
+    }
+
+    // 2) FALLBACK: Esri World Imagery tiles (stitch 4x3 grid)
+    if (!satelliteComposite) {
+      const latLngToTile = (latDeg: number, lngDeg: number, zoom: number) => {
+        const n = 1 << zoom;
+        const x = Math.floor((lngDeg + 180) / 360 * n);
+        const latRad = latDeg * Math.PI / 180;
+        const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+        return { x, y };
+      };
+
+      const zoom = 7;
+      const centerTile = latLngToTile(lat, lng, zoom);
+      const tilesX = 4;
+      const tilesY = 3;
+      const tileSize = 256;
+
+      const compositeCanvas = document.createElement('canvas');
+      compositeCanvas.width = tilesX * tileSize;
+      compositeCanvas.height = tilesY * tileSize;
+      const compCtx = compositeCanvas.getContext('2d');
+
+      if (compCtx) {
+        compCtx.fillStyle = '#0f172a';
+        compCtx.fillRect(0, 0, compositeCanvas.width, compositeCanvas.height);
+
+        const startX = centerTile.x - Math.floor(tilesX / 2);
+        const startY = centerTile.y - Math.floor(tilesY / 2);
+
+        const tilePromises: Promise<{ img: HTMLImageElement | null; dx: number; dy: number }>[] = [];
+        for (let ty = 0; ty < tilesY; ty++) {
+          for (let tx = 0; tx < tilesX; tx++) {
+            const url = `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${startY + ty}/${startX + tx}`;
+            tilePromises.push(
+              loadImageWithTimeout(url, 4000, true).then(img => ({ img, dx: tx * tileSize, dy: ty * tileSize }))
+            );
+          }
+        }
+
+        const results = await Promise.all(tilePromises);
+        let loadedCount = 0;
+        for (const { img, dx, dy } of results) {
+          if (img && img.complete && img.naturalWidth > 0) {
+            try { compCtx.drawImage(img, dx, dy, tileSize, tileSize); loadedCount++; } catch (e) {}
+          }
+        }
+
+        console.log(`Esri satellite tiles loaded: ${loadedCount}/${tilesX * tilesY}`);
+        if (loadedCount > 0) satelliteComposite = compositeCanvas;
+      }
+    }
+
+    console.log(`Satellite terrain ready: ${satelliteComposite ? 'YES' : 'NO — using dark base'}`);
 
     // --- Video Ring State: independent ring lifecycle system for canvas ---
     interface CanvasRing {
@@ -1786,16 +1867,18 @@ Please compare:
       ctx.fillStyle = '#0f172a';
       ctx.fillRect(0, 0, recCanvas.width, recCanvas.height);
 
-      // 1. Draw Satellite Map Background (robust multi-fallback)
+      // 1. Draw Satellite Map Background (composite tile canvas)
       let terrainDrawn = false;
-      if (satelliteImg && satelliteImg.complete && satelliteImg.naturalWidth > 0) {
+      if (satelliteComposite) {
         try {
-          ctx.drawImage(satelliteImg, 0, 0, recCanvas.width, recCanvas.height);
+          ctx.drawImage(satelliteComposite, 0, 0, recCanvas.width, recCanvas.height);
           // Reduced overlay — keep terrain visible
           ctx.fillStyle = 'rgba(15, 23, 42, 0.18)';
           ctx.fillRect(0, 0, recCanvas.width, recCanvas.height);
           terrainDrawn = true;
-        } catch (e) {}
+        } catch (e) {
+          console.warn('Satellite composite drawImage failed:', e);
+        }
       }
       if (!terrainDrawn && mapCanvas) {
         try {
