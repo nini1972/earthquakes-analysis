@@ -153,7 +153,7 @@ export class MapApp extends LitElement {
   // Danger Zone & Video Recording State
   @state() showDangerZones = false;
   @state() isShockwaveAnimating = false;
-  @state() shockwaveProgress = 0; // 0 to 100%
+  @state() shockwaveRingCount = 0; // number of active rings (for UI reactivity)
   @state() isRecordingVideo = false;
   @state() recordingCountdown = 0;
   @state() recordedVideoUrl: string | null = null;
@@ -164,8 +164,10 @@ export class MapApp extends LitElement {
   @state() collapsedSections: Record<string, boolean> = {};
 
   private dangerZonePolylines: any[] = [];
-  private shockwavePolyline?: any;
-  private shockwaveInterval?: any;
+  private shockwaveRings: { polyline: any; progress: number; maxRadius: number; speed: number; color: string; baseWidth: number; type: 'p' | 's' }[] = [];
+  private shockwaveAnimFrame?: number;
+  private shockwaveSpawnTimer?: any;
+  private shockwaveLastSpawn = 0;
   private cameraOrbitInterval?: any;
   private mediaRecorder?: MediaRecorder;
   private recordedChunks: Blob[] = [];
@@ -1415,9 +1417,11 @@ Please compare:
       }
       this.dangerZonePolylines = [];
     }
-    if (this.shockwavePolyline) {
-      try { this.shockwavePolyline.remove(); } catch (e) {}
-      this.shockwavePolyline = undefined;
+    if (this.shockwaveRings && this.shockwaveRings.length > 0) {
+      for (const ring of this.shockwaveRings) {
+        try { ring.polyline.remove(); } catch (e) {}
+      }
+      this.shockwaveRings = [];
     }
     this.showDangerZones = false;
     this.requestUpdate();
@@ -1440,46 +1444,124 @@ Please compare:
     const lat = coords[1];
     const lng = coords[0];
     const mag = (eq.properties ? eq.properties.mag : eq.mag) || 5.0;
-    const maxRadius = Math.max(50, Math.round(mag * 85));
+    const maxRadiusBase = Math.max(80, Math.round(mag * 100));
 
     this.isShockwaveAnimating = true;
-    this.shockwaveProgress = 0;
+    this.shockwaveRings = [];
+    this.shockwaveLastSpawn = 0;
 
-    this.shockwaveInterval = setInterval(() => {
-      this.shockwaveProgress = (this.shockwaveProgress + 3) % 100;
-      const currentRadius = Math.max(1, (this.shockwaveProgress / 100) * maxRadius);
+    // P-wave/S-wave color palettes
+    const pWaveColors = ['#06b6d4', '#22d3ee', '#67e8f9']; // cyan spectrum
+    const sWaveColors = ['#ef4444', '#f97316', '#f59e0b', '#eab308']; // red→yellow
 
-      if (this.shockwavePolyline) {
-        try { this.shockwavePolyline.remove(); } catch (e) {}
+    const spawnInterval = Math.max(500, 1200 - mag * 80); // faster spawn for bigger quakes
+
+    const spawnRing = () => {
+      if (!this.isShockwaveAnimating) return;
+
+      // Alternate P-wave (fast, thin, cyan) and S-wave (slow, thick, red/orange)
+      const isPWave = this.shockwaveRings.filter(r => r.progress < 100).length % 2 === 0;
+      const colorPalette = isPWave ? pWaveColors : sWaveColors;
+      const color = colorPalette[Math.floor(Math.random() * colorPalette.length)];
+
+      this.shockwaveRings.push({
+        polyline: null as any,
+        progress: 0,
+        maxRadius: isPWave ? maxRadiusBase * 1.3 : maxRadiusBase,
+        speed: isPWave ? 2.8 : 1.5, // P-waves propagate ~2x faster
+        color,
+        baseWidth: isPWave ? 4 : 10,
+        type: isPWave ? 'p' : 's',
+      });
+    };
+
+    // Spawn first ring immediately
+    spawnRing();
+
+    // Spawn new rings periodically
+    this.shockwaveSpawnTimer = setInterval(() => {
+      if (!this.isShockwaveAnimating) return;
+      // Limit max concurrent rings to 12
+      const activeRings = this.shockwaveRings.filter(r => r.progress < 100);
+      if (activeRings.length < 12) {
+        spawnRing();
+      }
+    }, spawnInterval);
+
+    // Animation loop using requestAnimationFrame for smooth 60fps
+    const animate = () => {
+      if (!this.isShockwaveAnimating) return;
+
+      // Update each ring's progress
+      for (const ring of this.shockwaveRings) {
+        if (ring.progress >= 100) continue;
+        ring.progress = Math.min(100, ring.progress + ring.speed);
+
+        const currentRadius = Math.max(1, (ring.progress / 100) * ring.maxRadius);
+        const opacity = Math.max(0, 1.0 - (ring.progress / 100) * 0.85);
+        const strokeWidth = Math.max(1, ring.baseWidth * (1 - ring.progress / 200));
+
+        // Remove old polyline
+        if (ring.polyline) {
+          try { ring.polyline.remove(); } catch (e) {}
+          ring.polyline = null;
+        }
+
+        if (opacity <= 0.05) continue; // Don't render fully faded rings
+
+        try {
+          // Add sinusoidal distortion for earthquake-like irregularity
+          const altitudeBase = ring.type === 'p' ? 600 : 1200;
+          const altitude = altitudeBase + Math.sin(ring.progress * 0.15) * 300;
+
+          const circlePts = this.generateCircle3DCoordinates(lat, lng, currentRadius, altitude);
+          const line = new this.Polyline3DElement();
+          line.coordinates = circlePts;
+
+          // Color with opacity-adjusted hex
+          const alphaHex = Math.round(opacity * 255).toString(16).padStart(2, '0');
+          line.strokeColor = ring.color + alphaHex;
+          line.strokeWidth = strokeWidth;
+          (this.map as any).appendChild(line);
+          ring.polyline = line;
+        } catch (e) {
+          console.warn('Shockwave ring error:', e);
+        }
       }
 
-      try {
-        const circlePts = this.generateCircle3DCoordinates(lat, lng, currentRadius, 1000);
-        const line = new this.Polyline3DElement();
-        line.coordinates = circlePts;
-        line.strokeColor = '#ff2222';
-        line.strokeWidth = 10;
-        (this.map as any).appendChild(line);
-        this.shockwavePolyline = line;
-      } catch (e) {
-        console.warn('Shockwave line error:', e);
+      // Cleanup fully expanded rings
+      const expired = this.shockwaveRings.filter(r => r.progress >= 100 && r.polyline === null);
+      if (expired.length > 0) {
+        this.shockwaveRings = this.shockwaveRings.filter(r => !(r.progress >= 100 && r.polyline === null));
       }
-      this.requestUpdate();
-    }, 60);
+
+      this.shockwaveRingCount = this.shockwaveRings.filter(r => r.progress < 100).length;
+      this.shockwaveAnimFrame = requestAnimationFrame(animate);
+    };
+
+    this.shockwaveAnimFrame = requestAnimationFrame(animate);
   }
 
   stopShockwaveAnimation() {
-    if (this.shockwaveInterval) {
-      clearInterval(this.shockwaveInterval);
-      this.shockwaveInterval = undefined;
+    if (this.shockwaveAnimFrame) {
+      cancelAnimationFrame(this.shockwaveAnimFrame);
+      this.shockwaveAnimFrame = undefined;
     }
-    if (this.shockwavePolyline) {
-      try { this.shockwavePolyline.remove(); } catch (e) {}
-      this.shockwavePolyline = undefined;
+    if (this.shockwaveSpawnTimer) {
+      clearInterval(this.shockwaveSpawnTimer);
+      this.shockwaveSpawnTimer = undefined;
     }
+    for (const ring of this.shockwaveRings) {
+      if (ring.polyline) {
+        try { ring.polyline.remove(); } catch (e) {}
+      }
+    }
+    this.shockwaveRings = [];
+    this.shockwaveRingCount = 0;
     this.isShockwaveAnimating = false;
     this.requestUpdate();
   }
+
 
   trigger3DFlyoverOrbit(eq: any) {
     if (!this.map || !eq) return;
@@ -1576,22 +1658,69 @@ Please compare:
     const depth = coords ? coords[2] : 10;
     const dateStr = this.getUtcDateStr(eq.properties?.time || eq.time);
 
-    // Load high-resolution satellite terrain basemap for epicenter
-    const mapImg = new Image();
-    mapImg.crossOrigin = 'anonymous';
-    let mapImgLoaded = false;
-    mapImg.onload = () => { mapImgLoaded = true; };
-
-    const apiKey = (process.env as any).GOOGLE_MAPS_API_KEY || '';
     const lat = coords ? coords[1] : 0;
     const lng = coords ? coords[0] : 0;
 
-    if (apiKey) {
-      mapImg.src = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=8&size=800x450&scale=2&maptype=hybrid&key=${apiKey}`;
-    } else {
-      // Free CORS-friendly Esri World Imagery satellite map snapshot
-      mapImg.src = `https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/export?bbox=${lng - 1.2},${lat - 0.7},${lng + 1.2},${lat + 0.7}&bboxSR=4326&imageSR=4326&size=800,450&f=image`;
+    // --- Robust satellite terrain loading with await + timeout fallback ---
+    const loadSatelliteImage = (): Promise<HTMLImageElement | null> => {
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+
+        const timeout = setTimeout(() => {
+          console.warn('Satellite image load timeout — falling back to map canvas.');
+          resolve(null);
+        }, 3500);
+
+        img.onload = () => { clearTimeout(timeout); resolve(img); };
+        img.onerror = () => { clearTimeout(timeout); resolve(null); };
+
+        const apiKey = (process.env as any).GOOGLE_MAPS_API_KEY || '';
+        if (apiKey) {
+          img.src = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lng}&zoom=8&size=800x450&scale=2&maptype=hybrid&key=${apiKey}`;
+        } else {
+          // Esri World Imagery — CORS-friendly, no API key needed
+          img.src = `https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/export?bbox=${lng - 1.5},${lat - 0.85},${lng + 1.5},${lat + 0.85}&bboxSR=4326&imageSR=4326&size=800,450&format=png&f=image`;
+        }
+      });
+    };
+
+    const satelliteImg = await loadSatelliteImage();
+
+    // --- Video Ring State: independent ring lifecycle system for canvas ---
+    interface CanvasRing {
+      progress: number;       // 0 → 100
+      speed: number;          // expansion speed per frame
+      maxRadius: number;      // max px radius
+      color: [number, number, number]; // RGB
+      baseWidth: number;
+      type: 'p' | 's';
     }
+
+    const canvasRings: CanvasRing[] = [];
+    const maxRingRadius = 280;
+    let ringSpawnAccum = 0;
+    const ringSpawnRate = Math.max(12, 40 - mag * 3); // frames between ring spawns
+
+    const pWaveRGB: [number, number, number][] = [[6, 182, 212], [34, 211, 238], [103, 232, 249]];
+    const sWaveRGB: [number, number, number][] = [[239, 68, 68], [249, 115, 22], [245, 158, 11], [234, 179, 8]];
+
+    const spawnCanvasRing = () => {
+      const isPWave = canvasRings.filter(r => r.progress < 100).length % 2 === 0;
+      const palette = isPWave ? pWaveRGB : sWaveRGB;
+      const rgb = palette[Math.floor(Math.random() * palette.length)];
+      canvasRings.push({
+        progress: 0,
+        speed: isPWave ? 2.2 : 1.1,
+        maxRadius: isPWave ? maxRingRadius * 1.2 : maxRingRadius,
+        color: rgb,
+        baseWidth: isPWave ? 3 : 7,
+        type: isPWave ? 'p' : 's',
+      });
+    };
+
+    // Spawn initial burst of rings
+    spawnCanvasRing();
 
     let progress = 0;
     const totalFrames = 180; // 6 seconds @ 30 FPS
@@ -1657,22 +1786,29 @@ Please compare:
       ctx.fillStyle = '#0f172a';
       ctx.fillRect(0, 0, recCanvas.width, recCanvas.height);
 
-      // 1. Draw Satellite Map Background
-      if (mapImgLoaded && mapImg.complete && mapImg.naturalWidth > 0) {
+      // 1. Draw Satellite Map Background (robust multi-fallback)
+      let terrainDrawn = false;
+      if (satelliteImg && satelliteImg.complete && satelliteImg.naturalWidth > 0) {
         try {
-          ctx.drawImage(mapImg, 0, 0, recCanvas.width, recCanvas.height);
-          // Dark overlay tint for high contrast UI readability
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.35)';
+          ctx.drawImage(satelliteImg, 0, 0, recCanvas.width, recCanvas.height);
+          // Reduced overlay — keep terrain visible
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.18)';
           ctx.fillRect(0, 0, recCanvas.width, recCanvas.height);
+          terrainDrawn = true;
         } catch (e) {}
-      } else if (mapCanvas) {
+      }
+      if (!terrainDrawn && mapCanvas) {
         try {
           ctx.drawImage(mapCanvas, 0, 0, recCanvas.width, recCanvas.height);
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.15)';
+          ctx.fillRect(0, 0, recCanvas.width, recCanvas.height);
+          terrainDrawn = true;
         } catch (e) {}
       }
 
-      // Draw Grid Lines
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+      // Subtle grid overlay (less opaque when terrain is showing)
+      const gridOpacity = terrainDrawn ? 0.04 : 0.08;
+      ctx.strokeStyle = `rgba(255, 255, 255, ${gridOpacity})`;
       ctx.lineWidth = 1;
       for (let x = 0; x < recCanvas.width; x += 40) {
         ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, recCanvas.height); ctx.stroke();
@@ -1684,43 +1820,93 @@ Please compare:
       const cx = recCanvas.width / 2;
       const cy = recCanvas.height / 2 + 10;
 
-      // Draw Expanding Shockwave Rings
-      const waveRadius = (progress / 100) * 260;
+      // --- Spawn new rings periodically ---
+      ringSpawnAccum++;
+      if (ringSpawnAccum >= ringSpawnRate && canvasRings.filter(r => r.progress < 100).length < 14) {
+        spawnCanvasRing();
+        ringSpawnAccum = 0;
+      }
 
-      // Light Shaking (Yellow)
+      // --- Draw Dynamic Multi-Ring Shockwaves ---
+      for (const ring of canvasRings) {
+        if (ring.progress >= 100) continue;
+        ring.progress = Math.min(100, ring.progress + ring.speed);
+
+        const radius = Math.max(2, (ring.progress / 100) * ring.maxRadius);
+        const opacity = Math.max(0, 1.0 - (ring.progress / 100) * 0.9);
+        const lineWidth = Math.max(1, ring.baseWidth * (1 - ring.progress / 180));
+
+        if (opacity <= 0.03) continue;
+
+        const [r, g, b] = ring.color;
+
+        // Ring fill (very subtle, semi-transparent)
+        ctx.beginPath();
+        // Sinusoidal distortion for earthquake-like irregularity
+        const distortion = 1 + Math.sin(ring.progress * 0.2 + frameCount * 0.08) * 0.03;
+        ctx.ellipse(cx, cy, radius * distortion, radius / distortion, 0, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${(opacity * 0.08).toFixed(3)})`;
+        ctx.fill();
+
+        // Ring stroke
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, radius * distortion, radius / distortion, 0, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${opacity.toFixed(3)})`;
+        ctx.lineWidth = lineWidth;
+        ctx.stroke();
+
+        // Outer glow for S-waves
+        if (ring.type === 's' && opacity > 0.3) {
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, radius * distortion + 3, radius / distortion + 3, 0, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${(opacity * 0.3).toFixed(3)})`;
+          ctx.lineWidth = lineWidth + 4;
+          ctx.stroke();
+        }
+      }
+
+      // Remove fully expired rings
+      const activeCount = canvasRings.filter(r => r.progress < 100).length;
+      if (canvasRings.length > activeCount + 20) {
+        canvasRings.splice(0, canvasRings.length - activeCount - 5);
+      }
+
+      // --- Pulsing Epicenter Marker with Glow ---
+      const pulsePhase = Math.sin(frameCount * 0.15) * 0.5 + 0.5; // 0..1
+      const epicenterRadius = 8 + pulsePhase * 5;
+
+      // Outer glow
+      const glowGrad = ctx.createRadialGradient(cx, cy, 0, cx, cy, epicenterRadius * 3);
+      glowGrad.addColorStop(0, `rgba(239, 68, 68, ${(0.4 + pulsePhase * 0.3).toFixed(2)})`);
+      glowGrad.addColorStop(0.5, 'rgba(239, 68, 68, 0.1)');
+      glowGrad.addColorStop(1, 'rgba(239, 68, 68, 0)');
       ctx.beginPath();
-      ctx.arc(cx, cy, Math.max(10, waveRadius), 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(245, 158, 11, 0.8)';
-      ctx.lineWidth = 4;
-      ctx.stroke();
-      ctx.fillStyle = 'rgba(245, 158, 11, 0.1)';
+      ctx.arc(cx, cy, epicenterRadius * 3, 0, Math.PI * 2);
+      ctx.fillStyle = glowGrad;
       ctx.fill();
 
-      // Moderate Shaking (Orange)
+      // Core dot
       ctx.beginPath();
-      ctx.arc(cx, cy, Math.max(5, waveRadius * 0.65), 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(249, 115, 22, 0.9)';
-      ctx.lineWidth = 6;
-      ctx.stroke();
-      ctx.fillStyle = 'rgba(249, 115, 22, 0.2)';
-      ctx.fill();
-
-      // Heavy Core Shaking (Red)
-      ctx.beginPath();
-      ctx.arc(cx, cy, Math.max(3, waveRadius * 0.35), 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(239, 68, 68, 1.0)';
-      ctx.lineWidth = 8;
-      ctx.stroke();
-      ctx.fillStyle = 'rgba(239, 68, 68, 0.35)';
-      ctx.fill();
-
-      // Epicenter Marker
-      ctx.beginPath();
-      ctx.arc(cx, cy, 10, 0, Math.PI * 2);
+      ctx.arc(cx, cy, epicenterRadius, 0, Math.PI * 2);
       ctx.fillStyle = '#ef4444';
       ctx.fill();
       ctx.strokeStyle = '#ffffff';
-      ctx.lineWidth = 3;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+
+      // Inner bright core
+      ctx.beginPath();
+      ctx.arc(cx, cy, epicenterRadius * 0.4, 0, Math.PI * 2);
+      ctx.fillStyle = '#fca5a5';
+      ctx.fill();
+
+      // --- Cinematic scan-line effect ---
+      const scanY = (frameCount * 3) % recCanvas.height;
+      ctx.strokeStyle = 'rgba(59, 130, 246, 0.12)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, scanY);
+      ctx.lineTo(recCanvas.width, scanY);
       ctx.stroke();
 
       // Top Header Telemetry HUD
@@ -1732,21 +1918,24 @@ Please compare:
 
       ctx.fillStyle = '#94a3b8';
       ctx.font = '12px sans-serif';
-      ctx.fillText(`UTC: ${dateStr} | Depth: ${depth}km | Wave Expansion: ${Math.round(progress)}%`, 16, 44);
+      const activeWaves = canvasRings.filter(r => r.progress < 100).length;
+      ctx.fillText(`UTC: ${dateStr} | Depth: ${depth}km | Active Waves: ${activeWaves} | Expansion: ${Math.round(progress)}%`, 16, 44);
 
       // Bottom Telemetry Badge
       ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-      ctx.fillRect(16, recCanvas.height - 75, 280, 60);
+      ctx.fillRect(16, recCanvas.height - 80, 310, 66);
       ctx.strokeStyle = '#3b82f6';
       ctx.lineWidth = 1;
-      ctx.strokeRect(16, recCanvas.height - 75, 280, 60);
+      ctx.strokeRect(16, recCanvas.height - 80, 310, 66);
 
-      ctx.fillStyle = '#ef4444';
+      ctx.fillStyle = '#06b6d4';
       ctx.font = 'bold 12px sans-serif';
-      ctx.fillText(`🚨 MMI VIII+ Heavy Shaking Core`, 26, recCanvas.height - 55);
+      ctx.fillText(`⚡ P-Wave (Primary): ~${(6.5 + Math.random() * 1.5).toFixed(1)} km/s`, 26, recCanvas.height - 60);
+      ctx.fillStyle = '#ef4444';
+      ctx.fillText(`🔥 S-Wave (Secondary): ~${(3.5 + Math.random() * 0.8).toFixed(1)} km/s`, 26, recCanvas.height - 42);
       ctx.fillStyle = '#cbd5e1';
       ctx.font = '11px sans-serif';
-      ctx.fillText(`PGA Accel: ~${(mag * 7.5).toFixed(1)}%g | Status: REC 🔴`, 26, recCanvas.height - 35);
+      ctx.fillText(`PGA Accel: ~${(mag * 7.5).toFixed(1)}%g | Status: REC 🔴`, 26, recCanvas.height - 24);
 
       // Countdown in Top Right
       ctx.fillStyle = '#ef4444';
